@@ -13,7 +13,7 @@
 ## Installation
 ### Build locally
 ```bash
-git clone https://example.org/your/methylsim.git
+git clone git@github.com:SorenHeidelbach/methylsim.git
 cd methylsim
 cargo build --release
 # binary at target/release/methylsim
@@ -21,6 +21,8 @@ cargo build --release
 
 ### Install into `$HOME/.cargo/bin`
 ```bash
+git clone git@github.com:SorenHeidelbach/methylsim.git
+cd methylsim
 cargo install --path .
 ```
 
