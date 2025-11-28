@@ -118,15 +118,66 @@ Notes:
 
 Repeat `--motif` or use comma-separated entries (e.g. `--motif CG,GC_m_0`). Use `--motifs-file` for one-per-line specifications (lines starting with `#` are ignored).
 
-Methylation-related flags:
+# Full help output
 
-| Flag | Description |
-| --- | --- |
-| `--motif-high-prob` | Probability that a motif hit is “high” methylated (default 0.95). |
-| `--non-motif-high-prob` | Background probability for other canonical bases (default 0.01). |
-| `--high-ml-mean`, `--high-ml-std` | Distribution parameters for ML values of methylated bases. |
-| `--low-ml-mean`, `--low-ml-std` | Distribution parameters for ML values of unmethylated bases. |
+```
+Simulate nanopore reads with MM/ML tags
 
-## Outputs
-- **FASTQ** (`--output-fastq`, default `methylsim.fastq`): sequences with MM/ML tags appended to the header.
-- **Tags TSV** (`--tags-tsv`): columns `read_id`, `MM`, `ML` for reuse or auditing.
+Usage: methylsim [OPTIONS]
+
+Options:
+  -h, --help     Print help
+  -V, --version  Print version
+
+Input/Annotation:
+      --reads <READS>          Existing reads (FASTQ/FASTA) to annotate instead of simulating
+      --reference <REFERENCE>  Reference FASTA used when simulating reads
+
+Motif Definitions:
+      --motif <MOTIFS>...          One or more motif specifications (motif[:canonical[:offset[:mod[:strand]]]] or sequence_modtype_offset[_strand])
+      --motifs-file <MOTIFS_FILE>  File containing motif specifications (one per line, '#' for comments)
+
+Simulation:
+      --simulator <SIMULATOR>
+          Simulation mode for generating reads when --reads is not supplied [default: builtin] [possible values: builtin, badreads]
+      --num-reads <NUM_READS>
+          Number of reads to simulate [default: 100]
+      --read-length <READ_LENGTH>
+          Target read length (treated as the peak of the distribution) [default: 5000]
+      --read-length-mean <READ_LENGTH_MEAN>
+          Mean read length for simulated reads (overrides --read-length)
+      --read-length-n50 <READ_LENGTH_N50>
+          Read length N50 for simulated reads (overrides --read-length)
+      --name-prefix <NAME_PREFIX>
+          Prefix used for naming simulated reads [default: methylsim]
+      --seed <SEED>
+          RNG seed shared by simulator and methylation annotator [default: 1]
+      --substitution-rate <SUBSTITUTION_RATE>
+          Substitution rate used by builtin simulator [default: 0.03]
+      --insertion-rate <INSERTION_RATE>
+          Insertion rate used by builtin simulator [default: 0.01]
+      --deletion-rate <DELETION_RATE>
+          Deletion rate used by builtin simulator [default: 0.01]
+
+Badreads Options:
+      --badreads-exec <BADREADS_EXEC>    Path to badreads executable
+      --badreads-extra <BADREADS_EXTRA>  Additional arguments forwarded to badreads (quoted string)
+
+Methylation Model:
+      --motif-high-prob <MOTIF_HIGH_PROB>
+          Probability that a motif hit carries high methylation (true positive rate) [default: 0.95]
+      --non-motif-high-prob <NON_MOTIF_HIGH_PROB>
+          Probability that a non-motif canonical base carries high methylation (false positive rate) [default: 0.01]
+      --high-ml-mean <HIGH_ML_MEAN>
+          Mean ML tag value (0-255) for high methylation events [default: 230]
+      --high-ml-std <HIGH_ML_STD>
+          Standard deviation for high methylation ML values [default: 10]
+      --low-ml-mean <LOW_ML_MEAN>
+          Mean ML tag value for low methylation events [default: 20]
+      --low-ml-std <LOW_ML_STD>
+          Standard deviation for low methylation ML values [default: 5]
+
+Output:
+      --output-fastq <OUTPUT_FASTQ>  Output FASTQ file [default: methylsim.fastq]
+      --tags-tsv <TAGS_TSV>          Optional TSV output listing MM/ML tags per read```
+```
