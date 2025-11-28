@@ -1,0 +1,7 @@
+/target
+# pixi environments
+.pixi/*
+.pixi/config.toml
+.snakemake
+environments
+results

@@ -1,0 +1,32 @@
+[workspace]
+authors = ["lx38ll <lx38ll@bio.aau.dk>"]
+channels = ["conda-forge", "bioconda"]
+name = "methylsim"
+platforms = ["linux-64"]
+version = "0.1.0"
+
+
+[dependencies]
+python = "3.13.*"
+
+
+[pypi-dependencies]
+snakemake = { version = ">=9.14.0, <10", extras = ["toml"] }
+
+[environments]
+mutation-simulator = ["mutation-simulator"]
+methylsim = ["methylsim"]
+modkit = ["modkit"]
+nanomotif = ["nanomotif"]
+
+[feature.mutation-simulator.pypi-dependencies]
+mutation-simulator = ">=3.0.2"
+
+[feature.methylsim.pypi-dependencies]
+badread = { git = "https://github.com/rrwick/Badread.git" }
+
+[feature.modkit]
+dependencies = { ont-modkit = ">=0.5.0" }
+
+[feature.nanomotif.pypi-dependencies]
+nanomotif = ">=1.1.2"

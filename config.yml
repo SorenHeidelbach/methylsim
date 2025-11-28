@@ -1,0 +1,18 @@
+
+
+samples:
+  ZymoFecal_contig_1330:
+    ref: "resources/ZymoFecal_contig_1330.fasta"
+    contig_bin: "resources/contig_bin.tsv"
+
+reference_mutation:
+  snp_rate: [0.01, 0.001]
+
+methylation_sim:
+  motifs:
+    - GATC_a_1
+    - CCWGG_m_1
+    - GCWGC_m_1
+  motif_high_prob_rate: 0.9
+  non_motif_high_prob_rate: 0.01
+  coverage: 50
