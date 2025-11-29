@@ -57,6 +57,59 @@ pub struct MotifSampler {
 
 type EventMap = HashMap<(char, String, char), HashMap<usize, f64>>;
 
+const MAX_PARSE_WARNINGS: usize = 20;
+
+struct ParseWarningTracker {
+    count: usize,
+    max_warnings: usize,
+}
+
+impl ParseWarningTracker {
+    fn new() -> Self {
+        Self {
+            count: 0,
+            max_warnings: MAX_PARSE_WARNINGS,
+        }
+    }
+
+    fn record_failure(&mut self, read_id: &str, error: &anyhow::Error) {
+        if self.count < self.max_warnings {
+            eprintln!("warning: failed to parse modifications for read {}: {}", read_id, error);
+        } else if self.count == self.max_warnings {
+            eprintln!("warning: additional modification parse failures suppressed");
+        }
+        self.count += 1;
+    }
+
+    fn report(&self) {
+        if self.count > 0 {
+            eprintln!(
+                "warning: skipped {} reads with incompatible MM/ML tags (counts suppressed after first {})",
+                self.count, self.max_warnings
+            );
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SkipMode {
+    /// Explicit mode (?): only report modifications, not unmodified canonical bases
+    Explicit,
+    /// Implicit mode (.): report both modifications and unmodified canonical bases
+    ImplicitUnmodified,
+    /// Default: behave like ImplicitUnmodified
+    DefaultImplicitUnmodified,
+}
+
+impl SkipMode {
+    fn is_implicit(self) -> bool {
+        matches!(
+            self,
+            SkipMode::ImplicitUnmodified | SkipMode::DefaultImplicitUnmodified
+        )
+    }
+}
+
 pub fn learn_model_from_reads(
     reads_path: &Path,
     motifs: &[MotifDefinition],
@@ -78,6 +131,7 @@ pub fn learn_model_from_reads(
     let mut reads_with_tags = 0;
     let mut reads_without_tags = 0;
     let mut total_reads = 0;
+    let mut warning_tracker = ParseWarningTracker::new();
 
     // Process reads in streaming fashion to minimize memory usage
     process_fastq_streaming(reads_path, true, |read| {
@@ -95,14 +149,22 @@ pub fn learn_model_from_reads(
             motif_positions.entry(group_key).or_default().extend(hits);
         }
 
-        // Parse tags only for positions that match motifs
-        let parsed = parse_tagged_events_filtered(read, &motif_positions)?;
-
-        if parsed.is_some() {
-            reads_with_tags += 1;
-        } else {
-            reads_without_tags += 1;
-        }
+        // Parse tags only for positions that match motifs - gracefully handle errors
+        let parsed = match parse_tagged_events_filtered(read, &motif_positions) {
+            Ok(Some(events)) => {
+                reads_with_tags += 1;
+                Some(events)
+            }
+            Ok(None) => {
+                reads_without_tags += 1;
+                None
+            }
+            Err(e) => {
+                warning_tracker.record_failure(&read.name, &e);
+                reads_without_tags += 1;
+                None
+            }
+        };
 
         // Collect probabilities for each motif
         for motif in motifs {
@@ -122,6 +184,9 @@ pub fn learn_model_from_reads(
 
         Ok(())
     })?;
+
+    // Report parse failures summary
+    warning_tracker.report();
 
     eprintln!(
         "  - {} reads with MM/ML tags ({:.1}%)",
@@ -350,15 +415,8 @@ fn parse_tagged_events_filtered(
     let Some(mm_tag) = mm_tag else {
         return Ok(None);
     };
-    // Parse ML values with graceful error handling
-    let ml_values = match parse_ml_values(ml_tag) {
-        Ok(vals) => vals,
-        Err(e) => {
-            // Gracefully skip reads with bad ML tags
-            debug!("Skipping read with invalid ML tag: {}", e);
-            return Ok(None);
-        }
-    };
+    // Parse ML values - return error for warning tracker
+    let ml_values = parse_ml_values(ml_tag).context("Invalid ML tag format")?;
 
     let mut ml_iter = ml_values.into_iter();
     let segments = normalize_mm_segments(mm_tag);
@@ -371,11 +429,10 @@ fn parse_tagged_events_filtered(
     let mut total_modifications = 0;
 
     for segment in segments {
-        let (base, strand, mod_code, deltas) = match parse_mm_segment(&segment) {
+        let (base, strand, mod_code, deltas, skip_mode) = match parse_mm_segment(&segment) {
             Some(parsed) => parsed,
             None => {
-                debug!("Skipping invalid MM segment: {}", segment);
-                continue;
+                bail!("Invalid MM segment format: {}", segment);
             }
         };
 
@@ -383,24 +440,25 @@ fn parse_tagged_events_filtered(
         let group_key = (base, mod_code.clone(), strand);
         let is_target_group = motif_positions.contains_key(&group_key);
 
-        // Decode positions with validation
-        let positions = match decode_positions_validated(sequence, base, &deltas, &segment) {
-            Ok(pos) => pos,
-            Err(e) => {
-                debug!("Skipping segment due to validation error: {}", e);
-                // Skip ML values for this segment
-                for _ in 0..deltas.len() {
-                    ml_iter.next();
-                }
-                continue;
-            }
-        };
+        // Get all canonical positions for tracking used positions
+        let canonical_positions = get_canonical_positions(sequence, base);
 
-        total_modifications += positions.len();
+        // Decode modification positions with validation
+        let mod_positions = decode_positions_validated(sequence, base, &deltas, &segment)?;
+
+        total_modifications += mod_positions.len();
+
+        // Track which canonical positions are explicitly modified
+        let mut used_canonical_indices = vec![false; canonical_positions.len()];
+        for &mod_pos in &mod_positions {
+            if let Some(canonical_idx) = canonical_positions.iter().position(|&p| p == mod_pos) {
+                used_canonical_indices[canonical_idx] = true;
+            }
+        }
 
         if !is_target_group {
             // Skip ML values for this segment since we don't care about it
-            for _ in &positions {
+            for _ in &mod_positions {
                 ml_iter.next();
             }
             continue;
@@ -408,7 +466,8 @@ fn parse_tagged_events_filtered(
 
         let target_positions = motif_positions.get(&group_key).unwrap();
 
-        for pos in positions {
+        // Process explicit modifications
+        for pos in mod_positions {
             match ml_iter.next() {
                 Some(ml) => {
                     // Only store if this position matches a motif
@@ -420,8 +479,20 @@ fn parse_tagged_events_filtered(
                     }
                 }
                 None => {
-                    debug!("ML tag shorter than MM events (expected more values)");
-                    break;
+                    bail!("ML tag has fewer values than MM modifications (expected at least {} more)", total_modifications - (ml_iter.len() + 1));
+                }
+            }
+        }
+
+        // Handle implicit unmodified bases if skip mode is implicit
+        if skip_mode.is_implicit() {
+            for (canonical_idx, &pos) in canonical_positions.iter().enumerate() {
+                if !used_canonical_indices[canonical_idx] && target_positions.contains(&pos) {
+                    // This canonical base is unmodified (implicitly prob=0)
+                    grouped
+                        .entry(group_key.clone())
+                        .or_default()
+                        .insert(pos, 0.0);
                 }
             }
         }
@@ -430,7 +501,7 @@ fn parse_tagged_events_filtered(
     // Validate ML tag length
     let remaining_ml = ml_iter.count();
     if remaining_ml > 0 {
-        debug!(
+        bail!(
             "ML tag contains {} extra values beyond {} MM modifications",
             remaining_ml, total_modifications
         );
@@ -490,13 +561,34 @@ fn normalize_mm_segments(mm_tag: &str) -> Vec<String> {
         .collect()
 }
 
-fn parse_mm_segment(segment: &str) -> Option<(char, char, String, Vec<usize>)> {
+fn parse_mm_segment(segment: &str) -> Option<(char, char, String, Vec<usize>, SkipMode)> {
     let marker_idx = segment.find(".,")?;
     let prefix = &segment[..marker_idx];
     let mut chars = prefix.chars();
     let base = chars.next()?;
     let strand = chars.next()?;
-    let mod_code: String = chars.collect();
+    let mut mod_code: String = chars.collect();
+
+    // Parse skip mode from modification code suffix
+    let mut skip_mode = SkipMode::DefaultImplicitUnmodified;
+    if let Some(last) = mod_code.chars().last() {
+        match last {
+            '?' => {
+                skip_mode = SkipMode::Explicit;
+                mod_code.pop();
+            }
+            '.' => {
+                skip_mode = SkipMode::ImplicitUnmodified;
+                mod_code.pop();
+            }
+            _ => {}
+        }
+    }
+
+    if mod_code.is_empty() {
+        return None;
+    }
+
     let mut deltas = Vec::new();
     for part in segment[marker_idx + 2..].split(',') {
         if part.is_empty() {
@@ -506,7 +598,7 @@ fn parse_mm_segment(segment: &str) -> Option<(char, char, String, Vec<usize>)> {
             deltas.push(delta);
         }
     }
-    Some((base, strand, mod_code, deltas))
+    Some((base, strand, mod_code, deltas, skip_mode))
 }
 
 fn decode_positions(sequence: &str, base: char, deltas: &[usize]) -> Vec<usize> {
@@ -645,5 +737,34 @@ mod tests {
         let positions = result.unwrap();
         // Should get both A positions: 0 and 3
         assert_eq!(positions, vec![0, 3]);
+    }
+
+    #[test]
+    fn parse_segment_detects_explicit_skip_mode() {
+        let result = parse_mm_segment("C+m?.,0,1");
+        assert!(result.is_some());
+        let (base, strand, mod_code, deltas, skip_mode) = result.unwrap();
+        assert_eq!(base, 'C');
+        assert_eq!(strand, '+');
+        assert_eq!(mod_code, "m");
+        assert_eq!(deltas, vec![0, 1]);
+        assert_eq!(skip_mode, SkipMode::Explicit);
+    }
+
+    #[test]
+    fn parse_segment_detects_implicit_skip_mode() {
+        let result = parse_mm_segment("C+m..,0,1");
+        assert!(result.is_some());
+        let (_, _, _, _, skip_mode) = result.unwrap();
+        assert_eq!(skip_mode, SkipMode::ImplicitUnmodified);
+    }
+
+    #[test]
+    fn parse_segment_defaults_to_implicit_skip_mode() {
+        let result = parse_mm_segment("C+m.,0,1");
+        assert!(result.is_some());
+        let (_, _, _, _, skip_mode) = result.unwrap();
+        assert_eq!(skip_mode, SkipMode::DefaultImplicitUnmodified);
+        assert!(skip_mode.is_implicit());
     }
 }
