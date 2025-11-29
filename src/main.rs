@@ -4,7 +4,7 @@ mod simulator;
 mod tagging;
 
 use std::collections::HashMap;
-use std::fs::{File, read_to_string};
+use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -13,7 +13,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, ValueEnum};
 
 use fastx::{ReadRecord, read_fastx};
-use motif::MotifDefinition;
+use motif::{MotifDefinition, load_motif_file};
 use simulator::{BuiltinSimulator, ErrorProfile, ReadLengthSpec, load_references, run_badreads};
 use tagging::MethylationTagger;
 
@@ -145,6 +145,9 @@ struct Cli {
 struct WriteStats {
     total_reads: usize,
     tagged_reads: usize,
+    reads_with_motif_hits: usize,
+    total_motif_hits: usize,
+    total_motif_high: usize,
 }
 
 fn main() -> Result<()> {
@@ -247,6 +250,14 @@ fn run(cli: Cli) -> Result<()> {
         cli.output_fastq.display(),
         stats.tagged_reads
     );
+    if stats.total_reads > 0 {
+        let avg_motif_hits = stats.total_motif_hits as f64 / stats.total_reads as f64;
+        let avg_high_hits = stats.total_motif_high as f64 / stats.total_reads as f64;
+        println!(
+            "Motif summary: {} reads contained motif hits | avg motifs/read = {:.2} | avg high-methylated motifs/read = {:.2}",
+            stats.reads_with_motif_hits, avg_motif_hits, avg_high_hits
+        );
+    }
     if let Some(bam_in) = cli.bam_input.as_ref() {
         let bam_out = cli
             .bam_output
@@ -265,26 +276,41 @@ fn run(cli: Cli) -> Result<()> {
 fn collect_motif_specs(cli: &Cli) -> Result<Vec<String>> {
     let mut specs = cli.motifs.clone();
     if let Some(path) = &cli.motifs_file {
-        let contents = read_to_string(path)
-            .with_context(|| format!("Failed to read motif file '{}'", path.display()))?;
-        for line in contents.lines() {
-            let trimmed = line.split('#').next().unwrap_or("").trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            specs.push(trimmed.to_string());
-        }
-        if specs.is_empty() {
-            bail!(
-                "Motif file '{}' did not contain any usable entries",
-                path.display()
-            );
-        }
+        let mut file_specs = load_motif_file(path)?;
+        specs.append(&mut file_specs);
     }
-    if specs.is_empty() {
+    let mut filtered = Vec::with_capacity(specs.len());
+    for spec in specs {
+        if looks_like_motif_header(&spec) {
+            eprintln!("Warning: ignoring motif entry that looks like a header: {spec}");
+            continue;
+        }
+        filtered.push(spec);
+    }
+    if filtered.is_empty() {
         bail!("At least one motif specification must be supplied");
     }
-    Ok(specs)
+    eprintln!(
+        "methylsim: loaded {} motif(s): {}",
+        filtered.len(),
+        filtered.join(",")
+    );
+    Ok(filtered)
+}
+
+fn looks_like_motif_header(spec: &str) -> bool {
+    let lower = spec.to_ascii_lowercase();
+    let mut contains = 0usize;
+    for token in lower.split_whitespace() {
+        if token == "motif" || token == "motif_complement" {
+            contains |= 0b001;
+        } else if token == "mod_type" {
+            contains |= 0b010;
+        } else if token.starts_with("mod_position") {
+            contains |= 0b100;
+        }
+    }
+    contains == 0b111
 }
 
 fn validate_inputs(cli: &Cli) -> Result<()> {
@@ -453,6 +479,11 @@ fn write_read(
         )?;
     }
     stats.total_reads += 1;
+    stats.total_motif_hits += tags.motif_hit_count;
+    stats.total_motif_high += tags.motif_high_count;
+    if tags.motif_hit_count > 0 {
+        stats.reads_with_motif_hits += 1;
+    }
     Ok(())
 }
 

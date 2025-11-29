@@ -1,0 +1,199 @@
+from pathlib import Path
+from shlex import quote
+
+WORKFLOW_DIR = Path.cwd().resolve()
+PROJECT_ROOT = WORKFLOW_DIR.parent
+
+configfile: "config.yml"
+
+RESULTS_DIR = PROJECT_ROOT / "results"
+RESOURCES_DIR = WORKFLOW_DIR / "resources"
+RESULTS_FMT = RESULTS_DIR.as_posix() + "/{sample}/{mutation_params}"
+
+
+def rel_to_root(path_str: str) -> str:
+    path = Path(path_str)
+    if path.is_absolute():
+        return path.as_posix()
+    return (WORKFLOW_DIR / path).as_posix()
+
+
+def sample_reference(sample: str) -> str:
+    default = RESOURCES_DIR / "reference.fasta"
+    path = config["samples"][sample].get("ref", default.as_posix())
+    return rel_to_root(path)
+
+
+def sample_contig_bins(sample: str) -> str:
+    default = RESOURCES_DIR / "contig_bin.tsv"
+    path = config["samples"][sample].get("contig_bin", default.as_posix())
+    return rel_to_root(path)
+
+
+SAMPLES = list(config["samples"].keys())
+MUTATION_RATES = [
+    str(rate) for rate in config.get("reference_mutation", {}).get("snp_rate", [])
+]
+if not SAMPLES:
+    raise ValueError("config.yml must define at least one entry under `samples`.")
+if not MUTATION_RATES:
+    raise ValueError(
+        "config.yml must define one or more SNP rates under reference_mutation.snp_rate."
+    )
+
+METH_SIM = config.get("methylation_sim", {})
+if not METH_SIM.get("motifs"):
+    raise ValueError("methylation_sim.motifs must provide at least one motif descriptor.")
+
+MP_CFG = config.get("methylation_phasing", {})
+DEFAULT_MP_MANIFEST = MP_CFG.get(
+    "manifest", "/home/sh/development/methylation_phasing/Cargo.toml"
+)
+MP_COMMAND = MP_CFG.get(
+    "command",
+    f"cargo run --quiet --release --manifest-path {DEFAULT_MP_MANIFEST} --",
+)
+MP_THREADS = MP_CFG.get("threads", 4)
+MP_MIN_CLUSTER = MP_CFG.get("min_cluster_size", 5)
+MP_MIN_SAMPLES_FLAG = (
+    f"--min-samples {MP_CFG['min_samples']}" if MP_CFG.get("min_samples") else ""
+)
+MP_EMIT_FASTQ_FLAG = "--emit-fastq" if MP_CFG.get("emit_fastq") else ""
+
+
+def motif_arg_string() -> str:
+    """Format --motif arguments for methylsim."""
+    return " ".join(f"--motif {quote(m)}" for m in METH_SIM.get("motifs", []))
+
+
+def contig_bins_flag(sample: str) -> str:
+    bins = config["samples"][sample].get("contig_bin")
+    if not bins:
+        return ""
+    return f"--contig-bins {quote(sample_contig_bins(sample))}"
+
+
+rule all:
+    input:
+        expand(
+            RESULTS_FMT + "/split_reads/read_clustering.tsv",
+            sample=SAMPLES,
+            mutation_params=MUTATION_RATES,
+        )
+
+
+rule mutate_reference:
+    input:
+        lambda wildcards: sample_reference(wildcards.sample)
+    output:
+        outdir=directory(RESULTS_FMT + "/mutation_simulator"),
+        ref=RESULTS_FMT + "/mutation_simulator/mutated_reference_ms.fasta",
+    shell:
+        """
+        set -euo pipefail
+        mkdir -p {output.outdir}
+        pixi run -e mutation-simulator -- \
+            mutation-simulator -o {output.outdir}/mutated_reference {input} args --snp {wildcards.mutation_params}
+        # mutation-simulator writes *_ms.fasta under the requested prefix.
+        test -s {output.ref}
+        """
+
+
+rule simulate_reads_from_mutated_reference:
+    input:
+        ref=RESULTS_FMT + "/mutation_simulator/mutated_reference_ms.fasta",
+    output:
+        reads=RESULTS_FMT + "/simulated_reads.fastq",
+    params:
+        motif_args=motif_arg_string(),
+        motif_high_prob_rate=METH_SIM.get("motif_high_prob_rate", 0.9),
+        non_motif_high_prob_rate=METH_SIM.get("non_motif_high_prob_rate", 0.01),
+        coverage=METH_SIM.get("coverage", 30),
+    shell:
+        """
+        set -euo pipefail
+        pixi run -e methylsim -- \
+            methylsim --reference {input.ref} {params.motif_args} \
+            --motif-high-prob {params.motif_high_prob_rate} \
+            --non-motif-high-prob {params.non_motif_high_prob_rate} \
+            --output-fastq {output.reads} \
+            --simulator badreads \
+            --badreads-extra '--quantity {params.coverage}x'
+        """
+
+
+rule map_reads:
+    input:
+        reads=RESULTS_FMT + "/simulated_reads.fastq",
+        ref=RESULTS_FMT + "/mutation_simulator/mutated_reference_ms.fasta",
+    output:
+        bam=RESULTS_FMT + "/mapped_reads.bam",
+        bai=RESULTS_FMT + "/mapped_reads.bam.bai",
+    shell:
+        """
+        set -euo pipefail
+        minimap2 -ay -x map-ont {input.ref} {input.reads} | samtools sort -o {output.bam}
+        samtools index {output.bam}
+        """
+
+
+rule modkit_pileup:
+    input:
+        bam=RESULTS_FMT + "/mapped_reads.bam",
+    output:
+        pileup=RESULTS_FMT + "/modkit_pileup.bed",
+    shell:
+        """
+        set -euo pipefail
+        pixi run -e modkit -- \
+            modkit pileup {input.bam} {output.pileup}
+        """
+
+
+rule nanomotif_motif_discovery:
+    input:
+        pileup=RESULTS_FMT + "/modkit_pileup.bed",
+        ref=RESULTS_FMT + "/mutation_simulator/mutated_reference_ms.fasta",
+        contig_bin=lambda wildcards: sample_contig_bins(wildcards.sample),
+    output:
+        outdir=directory(RESULTS_FMT + "/nanomotif_motif_discovery"),
+        bin_motifs=RESULTS_FMT + "/nanomotif_motif_discovery/bin-motifs.tsv",
+    shell:
+        """
+        set -euo pipefail
+        pixi run -e nanomotif -- \
+            nanomotif motif_discovery {input.ref} {input.pileup} \
+            -c {input.contig_bin} --out {output.outdir} -v
+        test -s {output.bin_motifs}
+        """
+
+
+rule methylation_phasing_split_reads:
+    input:
+        bam=RESULTS_FMT + "/mapped_reads.bam",
+        bai=RESULTS_FMT + "/mapped_reads.bam.bai",
+        motifs=RESULTS_FMT + "/nanomotif_motif_discovery/bin-motifs.tsv",
+        reads=RESULTS_FMT + "/simulated_reads.fastq",
+    output:
+        outdir=directory(RESULTS_FMT + "/split_reads"),
+        summary=RESULTS_FMT + "/split_reads/read_clustering.tsv",
+    params:
+        mp_cmd=MP_COMMAND,
+        threads=MP_THREADS,
+        min_cluster=MP_MIN_CLUSTER,
+        min_samples_flag=MP_MIN_SAMPLES_FLAG,
+        emit_fastq_flag=MP_EMIT_FASTQ_FLAG,
+        contig_bins_flag=lambda wildcards: contig_bins_flag(wildcards.sample),
+    shell:
+        """
+        set -euo pipefail
+        mkdir -p {output.outdir}
+        {params.mp_cmd} split-reads {input.bam} \
+            --motif-file {input.motifs} \
+            --output-dir {output.outdir} \
+            --sequence-fallback {input.reads} \
+            --threads {params.threads} \
+            --min-cluster-size {params.min_cluster} \
+            {params.min_samples_flag} {params.emit_fastq_flag} {params.contig_bins_flag}
+        test -s {output.summary}
+        """

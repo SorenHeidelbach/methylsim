@@ -42,7 +42,7 @@ methylsim \
 Important global flags:
 - `--reference`: FASTA used for simulation (required unless you pass `--reads`).
 - `--reads`: FASTA/FASTQ to annotate instead of simulating.
-- `--motif` / `--motifs-file`: motif definition(s); at least one is required.
+- `--motif` / `--motifs-file`: motif definition(s); the file form expects `motif`, `mod_type`, `mod_position` columns (CSV/TSV) matching the methylation_phasing format (bin/contig columns are ignored).
 - `--seed`: RNG seed shared by the simulator and methylation tagger (default `1`).
 - `--output-fastq`: FASTQ output path (default `methylsim.fastq`).
 - `--tags-tsv`: optional TSV output containing `read_id`, `MM`, `ML`.
@@ -116,13 +116,22 @@ Notes:
 - Underscore syntax: `sequence_modtype_offset[_strand]`
   - Example: `CGCG_m_1_-` targets the cytosine at offset 1 on the reverse strand.
 
-Repeat `--motif` or use comma-separated entries (e.g. `--motif CG,GC_m_0`). Use `--motifs-file` for one-per-line specifications (lines starting with `#` are ignored).
+Repeat `--motif` or use comma-separated entries (e.g. `--motif CG,GC_m_0`). Use `--motifs-file` to load the same TSV/CSV schema used by `methylation_phasing`: required columns `motif`, `mod_type`, `mod_position` plus optional `motif_complement`/`mod_position_complement`. Any `bin`, `id`, or `reference` columns present in shared motif panels are simply ignored.
+
+Example `motifs.tsv`:
+
+```
+reference	motif	mod_position	mod_type	n_mod	n_nomod	motif_type	motif_complement	mod_position_complement	n_mod_complement	n_nomod_complement
+bin_1	CCWGG	1	m	51	0	palindrome	CCWGG	1	51	0
+bin_1	GCWGC	1	m	256	0	palindrome	GCWGC	1	256	0
+```
 
 # Full help output
 
 ```
 Simulate nanopore reads with MM/ML tags
 
+<<<<<<< HEAD
 Usage: methylsim [OPTIONS]
 
 Options:
@@ -181,3 +190,22 @@ Output:
       --output-fastq <OUTPUT_FASTQ>  Output FASTQ file [default: methylsim.fastq]
       --tags-tsv <TAGS_TSV>          Optional TSV output listing MM/ML tags per read```
 ```
+=======
+## Outputs
+- **FASTQ** (`--output-fastq`, default `methylsim.fastq`): sequences with MM/ML tags appended to the header.
+- **Tags TSV** (`--tags-tsv`): columns `read_id`, `MM`, `ML` for reuse or auditing.
+- **BAM** (`--bam-output`): written only when tagging an existing BAM/CRAM with `--bam-input`.
+- **Logging stats**: every run prints how many reads contained motif hits plus the average number of motif hits and high-methylation events per read, making it easy to catch mismatched motif definitions.
+
+## Workflow
+- Snakemake and Pixi project files now live under `workflow/` so the Rust crate and workflow dependencies stay separate.
+- Update `workflow/config.yml` with your samples, SNP rates, and simulation settings. Paths inside the config are resolved relative to the `workflow/` directory (so `resources/...` points at `workflow/resources/...`).
+- Run the workflow from that directory, e.g.
+
+```bash
+cd workflow
+XDG_CACHE_HOME=$PWD/.cache pixi run snakemake --cores 8
+```
+
+- The DAG mutates each reference at every SNP rate, simulates reads, discovers motifs with nanomotif, and finishes by running `methylation_phasing split-reads` using the discovered motifs. Outputs still land under the top-level `results/` directory next to the Rust crate.
+>>>>>>> 161fafc (Refactor code structure for improved readability and maintainability)

@@ -1,7 +1,5 @@
 /target
-# pixi environments
-.pixi/*
-.pixi/config.toml
-.snakemake
-environments
-results
+/results
+/workflow/.snakemake
+/workflow/.pixi
+/workflow/.cache

@@ -396,6 +396,7 @@ environments:
       - pypi: https://files.pythonhosted.org/packages/e7/e7/80988e32bf6f73919a113473a604f5a8f09094de312b9d52b79c2df7612b/jupyter_core-5.9.1-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/a9/21/9b05698b46f218fc0e118e1f8168395c65c8a2c750ae2bab54fc4bd4e0e8/markupsafe-3.0.3-cp313-cp313-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/a7/b7/132b1673c0ec00881d49d56c09624942fa0ebd2fc21d73d80647efa082e9/mygene-3.2.2-py2.py3-none-any.whl
+      - pypi: https://files.pythonhosted.org/packages/8b/c5/60cc2c5236a5f2bafcd82a6c87512872623d461d6d0636e1d38f66176d75/nanomotif-1.1.2-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/a9/82/0340caa499416c78e5d8f5f05947ae4bc3cba53c9f038ab6e9ed964e22f1/nbformat-5.10.4-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/07/c7/d64168da60332c17d24c0d2f08bdf3987e8d1ae9d84b5bbd0eec2eb26a55/networkx-3.6-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/05/35/fb1ada118002df3fe91b5c3b28bc0d90f879b881a5d8f68b1f9b79c44bfe/numpy-2.0.0.tar.gz
@@ -445,7 +446,6 @@ environments:
       - pypi: https://files.pythonhosted.org/packages/0b/2c/87f3254fd8ffd29e4c02732eee68a83a1d3c346ae39bc6822dcbcb697f2b/wheel-0.45.1-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/cf/67/d7a7c276d874e5d26738c22444d466a3a64ed541f6ef35f740dbd865bab4/wrapt-2.0.1-cp313-cp313-manylinux1_x86_64.manylinux_2_28_x86_64.manylinux_2_5_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/4d/63/6a44729fdc60eb255a7b156a84e7552290174a9bf151e3b6c18e83d6fbfa/yte-1.9.4-py3-none-any.whl
-      - pypi: /home/sh/development/nanomotif
 packages:
 - conda: https://conda.anaconda.org/conda-forge/linux-64/_libgcc_mutex-0.1-conda_forge.tar.bz2
   sha256: fe51de6107f9edc7aa4f786a70f4a883943bc9d39b3bb7307c04c41410990726
@@ -976,10 +976,10 @@ packages:
   sha256: 18d85d1b28ecee2be31d844607fb0c5f7d7c58573278432df819ee2a5e88fe46
   requires_dist:
   - biothings-client>=0.2.6
-- pypi: /home/sh/development/nanomotif
+- pypi: https://files.pythonhosted.org/packages/8b/c5/60cc2c5236a5f2bafcd82a6c87512872623d461d6d0636e1d38f66176d75/nanomotif-1.1.2-py3-none-any.whl
   name: nanomotif
-  version: 1.1.1
-  sha256: 6f0107eec4444fdd0c1f3773c448d9ccf0719d3c2fda41f76791f8eb2213ec0e
+  version: 1.1.2
+  sha256: 05e930ad6cb8ee7c54631ba97df173d58e004ffe8ec4ea6e40542cd36dfdcddd
   requires_dist:
   - wheel
   - requests

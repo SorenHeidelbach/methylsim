@@ -10,6 +10,8 @@ use crate::motif::MotifDefinition;
 pub struct TagResult {
     pub mm_tag: Option<String>,
     pub ml_tag: Option<String>,
+    pub motif_hit_count: usize,
+    pub motif_high_count: usize,
 }
 
 impl TagResult {}
@@ -117,15 +119,27 @@ impl MethylationTagger {
             .map(|b| b.to_ascii_uppercase())
             .collect();
         let mut events = Vec::new();
+        let mut motif_hit_count = 0usize;
+        let mut motif_high_count = 0usize;
         for idx in 0..self.groups.len() {
             let match_flags =
                 Self::collect_match_flags(&self.groups[idx], sequence, seq_bytes.len());
-            self.collect_events(idx, &seq_bytes, &match_flags, &mut events);
+            self.collect_events(
+                idx,
+                &seq_bytes,
+                &match_flags,
+                &mut events,
+                &mut motif_hit_count,
+                &mut motif_high_count,
+            );
         }
         if events.is_empty() {
             return TagResult::default();
         }
-        self.build_tags(sequence, events)
+        let mut result = self.build_tags(sequence, events);
+        result.motif_hit_count = motif_hit_count;
+        result.motif_high_count = motif_high_count;
+        result
     }
 
     fn collect_match_flags(group: &MotifGroup, sequence: &str, seq_len: usize) -> Vec<bool> {
@@ -146,6 +160,8 @@ impl MethylationTagger {
         seq_bytes: &[u8],
         match_flags: &[bool],
         events: &mut Vec<ModificationEvent>,
+        motif_hit_count: &mut usize,
+        motif_high_count: &mut usize,
     ) {
         let (canonical_base, strand, mod_code) = {
             let group = &self.groups[group_index];
@@ -164,6 +180,12 @@ impl MethylationTagger {
             };
             let is_high = self.sample_high(probability);
             let ml_value = self.sample_ml_value(is_high);
+            if is_motif {
+                *motif_hit_count += 1;
+                if is_high {
+                    *motif_high_count += 1;
+                }
+            }
             events.push(ModificationEvent {
                 position: idx,
                 ml_value,
@@ -281,6 +303,8 @@ impl MethylationTagger {
             TagResult {
                 mm_tag: Some(mm_tag),
                 ml_tag,
+                motif_hit_count: 0,
+                motif_high_count: 0,
             }
         }
     }

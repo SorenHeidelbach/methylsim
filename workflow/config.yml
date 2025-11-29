@@ -2,7 +2,7 @@
 
 samples:
   ZymoFecal_contig_1330:
-    ref: "resources/ZymoFecal_contig_1330.fasta"
+    ref: "resources/reference.fasta"
     contig_bin: "resources/contig_bin.tsv"
 
 reference_mutation:
