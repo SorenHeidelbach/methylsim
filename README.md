@@ -126,12 +126,21 @@ bin_1	CCWGG	1	m	51	0	palindrome	CCWGG	1	51	0
 bin_1	GCWGC	1	m	256	0	palindrome	GCWGC	1	256	0
 ```
 
+
+Example `motifs.tsv`:
+
+```
+reference	motif	mod_position	mod_type	n_mod	n_nomod	motif_type	motif_complement	mod_position_complement	n_mod_complement	n_nomod_complement
+bin_1	CCWGG	1	m	51	0	palindrome	CCWGG	1	51	0
+bin_1	GCWGC	1	m	256	0	palindrome	GCWGC	1	256	0
+```
+
 # Full help output
 
 ```
 Simulate nanopore reads with MM/ML tags
 
-<<<<<<< HEAD
+
 Usage: methylsim [OPTIONS]
 
 Options:
@@ -190,7 +199,7 @@ Output:
       --output-fastq <OUTPUT_FASTQ>  Output FASTQ file [default: methylsim.fastq]
       --tags-tsv <TAGS_TSV>          Optional TSV output listing MM/ML tags per read```
 ```
-=======
+
 ## Outputs
 - **FASTQ** (`--output-fastq`, default `methylsim.fastq`): sequences with MM/ML tags appended to the header.
 - **Tags TSV** (`--tags-tsv`): columns `read_id`, `MM`, `ML` for reuse or auditing.
@@ -208,4 +217,3 @@ XDG_CACHE_HOME=$PWD/.cache pixi run snakemake --cores 8
 ```
 
 - The DAG mutates each reference at every SNP rate, simulates reads, discovers motifs with nanomotif, and finishes by running `methylation_phasing split-reads` using the discovered motifs. Outputs still land under the top-level `results/` directory next to the Rust crate.
->>>>>>> 161fafc (Refactor code structure for improved readability and maintainability)
