@@ -77,18 +77,19 @@ struct SimulateArgs {
     /// Motif specification(s): 'motif[:canonical[:offset[:mod[:strand]]]]' or 'sequence_modtype_offset[_strand]'
     ///
     /// Examples: 'GATC:A:1:a:+' or 'CG_m_0' or 'CCWGG_5mC_1'
-    /// Can specify multiple times or use comma-separated values
+    /// Can specify multiple times or use comma-separated values.
+    /// If --model-in is provided and no motifs specified, uses motifs from model file.
     #[arg(
         long = "motif",
         num_args = 1..,
         value_delimiter = ',',
-        required_unless_present = "motifs_file",
-        help_heading = "Required: Motif Definitions"
+        required_unless_present_any = ["motifs_file", "model_in"],
+        help_heading = "Motif Definitions"
     )]
     motifs: Vec<String>,
 
     /// File with motif specifications (one per line, '#' for comments)
-    #[arg(long, help_heading = "Required: Motif Definitions")]
+    #[arg(long, help_heading = "Motif Definitions")]
     motifs_file: Option<PathBuf>,
 
     // ========== Simulation Options (when using --reference) ==========
@@ -248,15 +249,31 @@ fn main() -> Result<()> {
     }
 }
 
-fn collect_motif_specs(motifs: &[String], motifs_file: Option<&PathBuf>) -> Result<Vec<String>> {
-    debug!("Collecting motif specifications from command line and files");
+fn collect_motif_specs(
+    motifs: &[String],
+    motifs_file: Option<&PathBuf>,
+    model_path: Option<&PathBuf>,
+) -> Result<Vec<String>> {
+    debug!("Collecting motif specifications from command line, files, and model");
     let mut specs = motifs.to_vec();
+
     if let Some(path) = motifs_file {
         info!("Loading motifs from file: {}", path.display());
         let mut file_specs = load_motif_file(path)?;
         debug!("Loaded {} motif specs from file", file_specs.len());
         specs.append(&mut file_specs);
     }
+
+    // If no motifs provided but model is available, extract from model
+    if specs.is_empty() {
+        if let Some(model_path) = model_path {
+            info!("No motifs specified, extracting from model: {}", model_path.display());
+            let model = LearnedModel::load(model_path)?;
+            specs = model.extract_motif_specs();
+            info!("Extracted {} motif(s) from model", specs.len());
+        }
+    }
+
     let mut filtered = Vec::with_capacity(specs.len());
     for spec in specs {
         if looks_like_motif_header(&spec) {
@@ -266,9 +283,9 @@ fn collect_motif_specs(motifs: &[String], motifs_file: Option<&PathBuf>) -> Resu
         filtered.push(spec);
     }
     if filtered.is_empty() {
-        bail!("At least one motif specification must be supplied");
+        bail!("At least one motif specification must be supplied (via --motif, --motifs-file, or --model-in)");
     }
-    info!("Loaded {} motif(s): {}", filtered.len(), filtered.join(", "));
+    info!("Using {} motif(s): {}", filtered.len(), filtered.join(", "));
     Ok(filtered)
 }
 
@@ -353,7 +370,7 @@ fn run_simulate(args: SimulateArgs) -> Result<()> {
         let bam_out = args.bam_output.as_ref()
             .expect("--bam-output must be supplied when using --bam-input");
 
-        let motif_specs = collect_motif_specs(&args.motifs, args.motifs_file.as_ref())?;
+        let motif_specs = collect_motif_specs(&args.motifs, args.motifs_file.as_ref(), args.model_in.as_ref())?;
         let motifs = motif_specs
             .iter()
             .map(|spec| MotifDefinition::parse(spec))
@@ -381,7 +398,7 @@ fn run_simulate(args: SimulateArgs) -> Result<()> {
         return Ok(());
     }
 
-    let motif_specs = collect_motif_specs(&args.motifs, args.motifs_file.as_ref())?;
+    let motif_specs = collect_motif_specs(&args.motifs, args.motifs_file.as_ref(), args.model_in.as_ref())?;
     let motifs = motif_specs
         .iter()
         .map(|spec| MotifDefinition::parse(spec))
@@ -480,7 +497,7 @@ fn run_fit_model(args: FitModelArgs) -> Result<()> {
     info!("Starting model fitting");
     validate_fit_inputs(&args)?;
 
-    let motif_specs = collect_motif_specs(&args.motifs, args.motifs_file.as_ref())?;
+    let motif_specs = collect_motif_specs(&args.motifs, args.motifs_file.as_ref(), None)?;
     debug!("Parsing {} motif specifications", motif_specs.len());
     let motifs = motif_specs
         .iter()

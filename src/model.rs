@@ -287,6 +287,20 @@ pub fn learn_model_from_reads(
 }
 
 impl LearnedModel {
+    /// Extract motif specifications from the model
+    pub fn extract_motif_specs(&self) -> Vec<String> {
+        self.motifs
+            .iter()
+            .map(|m| {
+                // Format: motif:canonical:offset:mod:strand
+                format!(
+                    "{}:{}:{}:{}:{}",
+                    m.motif, m.canonical_base, m.canonical_offset, m.mod_code, m.strand
+                )
+            })
+            .collect()
+    }
+
     pub fn save(&self, path: &Path) -> Result<()> {
         let data = serde_json::to_vec_pretty(self)?;
         fs::write(path, data)
