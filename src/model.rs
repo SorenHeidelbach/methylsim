@@ -562,9 +562,12 @@ fn normalize_mm_segments(mm_tag: &str) -> Vec<String> {
 }
 
 fn parse_mm_segment(segment: &str) -> Option<(char, char, String, Vec<usize>, SkipMode)> {
-    let marker_idx = segment.find(".,")?;
-    let prefix = &segment[..marker_idx];
-    let mut chars = prefix.chars();
+    // Split by comma to separate header from deltas
+    let mut parts = segment.split(',');
+    let header = parts.next()?;
+
+    // Parse header: BASE+STRAND+CODE[SKIPMODE]
+    let mut chars = header.chars();
     let base = chars.next()?;
     let strand = chars.next()?;
     let mut mod_code: String = chars.collect();
@@ -589,15 +592,18 @@ fn parse_mm_segment(segment: &str) -> Option<(char, char, String, Vec<usize>, Sk
         return None;
     }
 
+    // Parse deltas (may be empty)
     let mut deltas = Vec::new();
-    for part in segment[marker_idx + 2..].split(',') {
-        if part.is_empty() {
+    for part in parts {
+        let trimmed = part.trim();
+        if trimmed.is_empty() {
             continue;
         }
-        if let Ok(delta) = part.parse::<usize>() {
+        if let Ok(delta) = trimmed.parse::<usize>() {
             deltas.push(delta);
         }
     }
+
     Some((base, strand, mod_code, deltas, skip_mode))
 }
 
@@ -741,7 +747,7 @@ mod tests {
 
     #[test]
     fn parse_segment_detects_explicit_skip_mode() {
-        let result = parse_mm_segment("C+m?.,0,1");
+        let result = parse_mm_segment("C+m?,0,1");
         assert!(result.is_some());
         let (base, strand, mod_code, deltas, skip_mode) = result.unwrap();
         assert_eq!(base, 'C');
@@ -753,7 +759,7 @@ mod tests {
 
     #[test]
     fn parse_segment_detects_implicit_skip_mode() {
-        let result = parse_mm_segment("C+m..,0,1");
+        let result = parse_mm_segment("C+m.,0,1");
         assert!(result.is_some());
         let (_, _, _, _, skip_mode) = result.unwrap();
         assert_eq!(skip_mode, SkipMode::ImplicitUnmodified);
@@ -761,10 +767,33 @@ mod tests {
 
     #[test]
     fn parse_segment_defaults_to_implicit_skip_mode() {
-        let result = parse_mm_segment("C+m.,0,1");
+        let result = parse_mm_segment("C+m,0,1");
         assert!(result.is_some());
         let (_, _, _, _, skip_mode) = result.unwrap();
         assert_eq!(skip_mode, SkipMode::DefaultImplicitUnmodified);
         assert!(skip_mode.is_implicit());
+    }
+
+    #[test]
+    fn parse_segment_handles_no_deltas_with_skip_mode() {
+        // Real-world case: C+21839. means 4mC implicit mode with no modifications
+        let result = parse_mm_segment("C+21839.");
+        assert!(result.is_some());
+        let (base, strand, mod_code, deltas, skip_mode) = result.unwrap();
+        assert_eq!(base, 'C');
+        assert_eq!(strand, '+');
+        assert_eq!(mod_code, "21839");
+        assert_eq!(deltas, Vec::<usize>::new());
+        assert_eq!(skip_mode, SkipMode::ImplicitUnmodified);
+    }
+
+    #[test]
+    fn parse_segment_handles_no_deltas_default() {
+        let result = parse_mm_segment("C+m");
+        assert!(result.is_some());
+        let (_, _, mod_code, deltas, skip_mode) = result.unwrap();
+        assert_eq!(mod_code, "m");
+        assert_eq!(deltas, Vec::<usize>::new());
+        assert_eq!(skip_mode, SkipMode::DefaultImplicitUnmodified);
     }
 }
