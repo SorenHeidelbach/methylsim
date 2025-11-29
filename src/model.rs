@@ -1,14 +1,15 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
+use log::{info, debug};
 use rand::Rng;
 use rand::rngs::StdRng;
 use rand_distr::{Beta, Distribution};
 use serde::{Deserialize, Serialize};
 
-use crate::fastx::ReadRecord;
+use crate::fastx::{ReadRecord, process_fastq_streaming};
 use crate::motif::MotifDefinition;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -54,18 +55,10 @@ pub struct MotifSampler {
     unmethylated_beta: Beta<f64>,
 }
 
-struct TaggedEvent {
-    position: usize,
-    canonical_base: char,
-    mod_code: String,
-    strand: char,
-    probability: f64,
-}
-
 type EventMap = HashMap<(char, String, char), HashMap<usize, f64>>;
 
 pub fn learn_model_from_reads(
-    reads: &[ReadRecord],
+    reads_path: &Path,
     motifs: &[MotifDefinition],
     threshold: f64,
 ) -> Result<LearnedModel> {
@@ -82,12 +75,38 @@ pub fn learn_model_from_reads(
         totals.insert(motif.model_key(), 0);
     }
 
-    for read in reads {
-        let parsed = parse_tagged_events(read)?;
+    let mut reads_with_tags = 0;
+    let mut reads_without_tags = 0;
+    let mut total_reads = 0;
+
+    // Process reads in streaming fashion to minimize memory usage
+    process_fastq_streaming(reads_path, true, |read| {
+        total_reads += 1;
+
+        // Find all motif positions in this read first
+        let mut motif_positions: HashMap<(char, String, char), HashSet<usize>> = HashMap::new();
         for motif in motifs {
             let key = motif.model_key();
-            let hits = motif.find_matches(&read.sequence);
+            let hits = motif.find_matches(read.sequence_str());
             *totals.entry(key.clone()).or_default() += hits.len();
+
+            // Store positions for this motif's base/mod/strand combination
+            let group_key = (motif.canonical_base, motif.mod_code.clone(), motif.strand);
+            motif_positions.entry(group_key).or_default().extend(hits);
+        }
+
+        // Parse tags only for positions that match motifs
+        let parsed = parse_tagged_events_filtered(read, &motif_positions)?;
+
+        if parsed.is_some() {
+            reads_with_tags += 1;
+        } else {
+            reads_without_tags += 1;
+        }
+
+        // Collect probabilities for each motif
+        for motif in motifs {
+            let key = motif.model_key();
             let Some(event_map) = parsed.as_ref() else {
                 continue;
             };
@@ -96,24 +115,66 @@ pub fn learn_model_from_reads(
             else {
                 continue;
             };
-            for pos in hits {
-                if let Some(prob) = probs.get(&pos) {
-                    values.entry(key.clone()).or_default().push(*prob);
-                }
+            for prob in probs.values() {
+                values.entry(key.clone()).or_default().push(*prob);
             }
         }
-    }
+
+        Ok(())
+    })?;
+
+    eprintln!(
+        "  - {} reads with MM/ML tags ({:.1}%)",
+        reads_with_tags,
+        if total_reads > 0 {
+            (reads_with_tags as f64 / total_reads as f64) * 100.0
+        } else {
+            0.0
+        }
+    );
+    eprintln!(
+        "  - {} reads without MM/ML tags ({:.1}%)",
+        reads_without_tags,
+        if total_reads > 0 {
+            (reads_without_tags as f64 / total_reads as f64) * 100.0
+        } else {
+            0.0
+        }
+    );
 
     let mut motif_models = Vec::new();
+    eprintln!("\nFitting model for {} motif(s)", motifs.len());
     for motif in motifs {
+        eprintln!("Processing motif: {}", motif.motif);
         let key = motif.model_key();
         let covered: Vec<f64> = values.remove(&key).unwrap_or_default();
         let total_sites = totals.remove(&key).unwrap_or_default();
+
+        eprintln!(
+            "  - Found {} total motif sites across all reads",
+            total_sites
+        );
+        eprintln!(
+            "  - {} sites have methylation probability data ({:.1}%)",
+            covered.len(),
+            if total_sites > 0 {
+                (covered.len() as f64 / total_sites as f64) * 100.0
+            } else {
+                0.0
+            }
+        );
+
         let methylated: Vec<f64> = covered
             .iter()
             .copied()
             .filter(|p| *p >= threshold)
             .collect();
+
+        eprintln!(
+            "  - {} sites considered methylated (probability >= {:.2})",
+            methylated.len(),
+            threshold
+        );
         let unmethylated: Vec<f64> = covered.iter().copied().filter(|p| *p < threshold).collect();
         let meth_beta = fit_beta(&methylated);
         let unmeth_beta = fit_beta(&unmethylated);
@@ -123,6 +184,20 @@ pub fn learn_model_from_reads(
             methylated.len() as f64 / covered.len() as f64
         };
         let empirical = EmpiricalDistribution::from_values(&covered, 0.05);
+
+        // Log per-motif statistics
+        let coverage_pct = if total_sites > 0 {
+            covered.len() as f64 / total_sites as f64 * 100.0
+        } else {
+            0.0
+        };
+        info!(
+            "  {} ({}): {} total sites, {} covered ({:.1}%), {:.1}% methylated",
+            motif.motif, key, total_sites, covered.len(), coverage_pct, methylated_fraction * 100.0
+        );
+        debug!("    Methylated: {} sites, Unmethylated: {} sites",
+               methylated.len(), unmethylated.len());
+
         motif_models.push(MotifModel {
             key,
             motif: motif.motif.clone(),
@@ -262,7 +337,11 @@ fn fit_beta(values: &[f64]) -> Option<BetaParams> {
     Some(BetaParams { alpha, beta, n })
 }
 
-fn parse_tagged_events(read: &ReadRecord) -> Result<Option<EventMap>> {
+/// Parse tagged events only for positions that match motifs (memory-optimized)
+fn parse_tagged_events_filtered(
+    read: &ReadRecord,
+    motif_positions: &HashMap<(char, String, char), HashSet<usize>>,
+) -> Result<Option<EventMap>> {
     let comment = match read.comment.as_deref() {
         Some(c) if !c.is_empty() => c,
         _ => return Ok(None),
@@ -277,35 +356,41 @@ fn parse_tagged_events(read: &ReadRecord) -> Result<Option<EventMap>> {
     if segments.is_empty() {
         return Ok(None);
     }
-    let mut events: Vec<TaggedEvent> = Vec::new();
+    let mut grouped: EventMap = HashMap::new();
     for segment in segments {
         let Some((base, strand, mod_code, deltas)) = parse_mm_segment(&segment) else {
             continue;
         };
-        let positions = decode_positions(&read.sequence, base, &deltas);
+
+        // Check if we care about this base/strand/mod combination
+        let group_key = (base, mod_code.clone(), strand);
+        let Some(target_positions) = motif_positions.get(&group_key) else {
+            // Skip ML values for this segment since we don't care about it
+            let positions = decode_positions(read.sequence_str(), base, &deltas);
+            for _ in positions {
+                ml_iter.next();
+            }
+            continue;
+        };
+
+        let positions = decode_positions(read.sequence_str(), base, &deltas);
         for pos in positions {
             if let Some(ml) = ml_iter.next() {
-                events.push(TaggedEvent {
-                    position: pos,
-                    canonical_base: base,
-                    mod_code: mod_code.clone(),
-                    strand,
-                    probability: (ml as f64) / 255.0,
-                });
+                // Only store if this position matches a motif
+                if target_positions.contains(&pos) {
+                    grouped
+                        .entry(group_key.clone())
+                        .or_default()
+                        .insert(pos, (ml as f64) / 255.0);
+                }
             }
         }
     }
-    if events.is_empty() {
-        return Ok(None);
+    if grouped.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(grouped))
     }
-    let mut grouped: EventMap = HashMap::new();
-    for event in events {
-        grouped
-            .entry((event.canonical_base, event.mod_code.clone(), event.strand))
-            .or_default()
-            .insert(event.position, event.probability);
-    }
-    Ok(Some(grouped))
 }
 
 fn extract_mm_ml(comment: &str) -> (Option<&str>, Option<&str>) {

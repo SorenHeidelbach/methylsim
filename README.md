@@ -49,6 +49,16 @@ Important global flags:
 - `--seed`: RNG seed shared by the simulator and methylation tagger (default `1`).
 - `--output-fastq`: FASTQ output path (default `methylsim.fastq`).
 
+Or specify absolute amount of sequence (e.g., 250 million bases):
+
+```bash
+methylsim simulate \
+  --reference resources/reference.fasta \
+  --motif GATC_6mA_1 \
+  --quantity 250M \
+  --read-length 5000 \
+  --output-fastq results/GATC_a_1.fastq
+```
 
 ### 2. `fit-model` - Learn methylation model from tagged reads
 Extract methylation patterns from real basecalled data:
@@ -82,7 +92,6 @@ methylsim simulate \
   - `--num-reads`: Legacy option (number of reads)
 - **Model**: `--model-in` to use learned model (optional)
 - **Output**: `--output-fastq` (FASTQ) and `--tags-tsv` (TSV table)
->>>>>>> 125d715 (Refactor code structure for improved readability and maintainability)
 
 ## Use cases
 
@@ -148,7 +157,7 @@ If you already have reads with MM/ML tags (e.g., real E. coli data with `GATC_6m
 
 **Input requirements:** FASTQ reads must already carry MM/ML tags in the header (e.g., produced by ONT basecalling and `samtools fastq`). Only FASTQ is supported for learning currently.
 
-#### Workflow:
+#### Single Motif Workflow:
 
 **Step 1:** Learn from tagged reads (here: E. coli with `GATC_6mA_1`)
 ```bash
@@ -171,6 +180,35 @@ methylsim simulate \
 ```
 - The learned model drives motif probabilities instead of `--motif-high-prob`
 - ML value distributions match the empirical data
+
+#### Multi-Motif Models:
+
+**Models support multiple motifs!** Learn methylation patterns for multiple motifs simultaneously:
+
+```bash
+# Learn model for both Dam (GATC) and Dcm (CCWGG) methylation
+methylsim fit-model \
+  --reads data/ecoli_tagged.fastq \
+  --motif GATC_6mA_1,CCWGG_5mC_1 \
+  --model-out models/ecoli_multi.json
+```
+
+The tool will print per-motif statistics:
+```
+Fitting model for 2 motif(s):
+  GATC (GATC_a_1_+): 1523 total sites, 1489 covered (97.8%), 94.2% methylated
+  CCWGG (CCWGG_m_1_+): 832 total sites, 798 covered (95.9%), 89.5% methylated
+```
+
+Then use the multi-motif model for simulation:
+```bash
+methylsim simulate \
+  --reference references/ecoli.fa \
+  --motif GATC_6mA_1,CCWGG_5mC_1 \
+  --model-in models/ecoli_multi.json \
+  --quantity 50x \
+  --output-fastq results/ecoli_sim.fastq
+```
 
 **Note:** If your FASTQ lacks MM/ML tags, you must tag it first (e.g., with a methylation caller or by running `methylsim simulate` in default high/low mode) before `fit-model` will learn anything.
 

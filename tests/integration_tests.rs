@@ -507,7 +507,7 @@ fn test_quantity_coverage() {
 
     // Verify stderr mentions coverage calculation
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("Calculating reads for") && stderr.contains("coverage"),
+    assert!(stderr.contains("Coverage-based quantity") && stderr.contains("coverage"),
             "Should mention coverage calculation");
 }
 
@@ -542,4 +542,137 @@ fn test_quantity_absolute() {
     let line_count = content.lines().count();
     // FASTQ has 4 lines per read
     assert!(line_count >= 400 && line_count <= 400, "Should have ~100 reads (400 lines)");
+}
+
+#[test]
+fn test_multi_motif_model_fitting() {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let tagged_reads = temp_dir.path().join("tagged.fastq");
+    let model_output = temp_dir.path().join("model.json");
+    let reference_path = get_test_data_path("test_reference.fasta");
+
+    // Generate reads with multiple motifs
+    let sim_output = Command::new(get_binary_path())
+        .arg("simulate")
+        .arg("--reference")
+        .arg(&reference_path)
+        .arg("--motif")
+        .arg("GATC_6mA_1,CCWGG_5mC_1")
+        .arg("--num-reads")
+        .arg("20")
+        .arg("--read-length")
+        .arg("150")
+        .arg("--output-fastq")
+        .arg(&tagged_reads)
+        .arg("--seed")
+        .arg("42")
+        .output()
+        .expect("Failed to simulate with multiple motifs");
+
+    assert!(sim_output.status.success(), "Simulate with multiple motifs failed");
+
+    // Fit model from reads with multiple motifs
+    let fit_output = Command::new(get_binary_path())
+        .arg("fit-model")
+        .arg("--reads")
+        .arg(&tagged_reads)
+        .arg("--motif")
+        .arg("GATC_6mA_1,CCWGG_5mC_1")
+        .arg("--model-out")
+        .arg(&model_output)
+        .output()
+        .expect("Failed to fit model with multiple motifs");
+
+    assert!(fit_output.status.success(), "Fit model with multiple motifs failed: {}",
+            String::from_utf8_lossy(&fit_output.stderr));
+    assert!(model_output.exists(), "Model JSON was not created");
+
+    // Verify model contains both motifs
+    let model_content = fs::read_to_string(&model_output).expect("Failed to read model");
+    assert!(model_content.contains("GATC"), "Model should contain GATC motif");
+    assert!(model_content.contains("CCWGG"), "Model should contain CCWGG motif");
+
+    // Parse JSON and verify structure
+    let model: serde_json::Value = serde_json::from_str(&model_content)
+        .expect("Failed to parse model JSON");
+
+    let motifs = model["motifs"].as_array().expect("Model should have motifs array");
+    assert_eq!(motifs.len(), 2, "Model should contain exactly 2 motifs");
+
+    // Verify stderr shows per-motif statistics
+    let stderr = String::from_utf8_lossy(&fit_output.stderr);
+    assert!(stderr.contains("Fitting model for 2 motif(s)"), "Should mention 2 motifs");
+    assert!(stderr.contains("GATC") && stderr.contains("CCWGG"),
+            "Should show statistics for both motifs");
+}
+
+#[test]
+fn test_simulate_with_multi_motif_model() {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let tagged_reads = temp_dir.path().join("tagged.fastq");
+    let model_file = temp_dir.path().join("model.json");
+    let output_with_model = temp_dir.path().join("output.fastq");
+    let reference_path = get_test_data_path("test_reference.fasta");
+
+    // Generate reads with multiple motifs
+    let sim1 = Command::new(get_binary_path())
+        .arg("simulate")
+        .arg("--reference")
+        .arg(&reference_path)
+        .arg("--motif")
+        .arg("GATC_6mA_1,CCWGG_5mC_1")
+        .arg("--num-reads")
+        .arg("15")
+        .arg("--read-length")
+        .arg("120")
+        .arg("--output-fastq")
+        .arg(&tagged_reads)
+        .arg("--seed")
+        .arg("42")
+        .output()
+        .expect("Failed to simulate");
+
+    assert!(sim1.status.success());
+
+    // Fit multi-motif model
+    let fit = Command::new(get_binary_path())
+        .arg("fit-model")
+        .arg("--reads")
+        .arg(&tagged_reads)
+        .arg("--motif")
+        .arg("GATC_6mA_1,CCWGG_5mC_1")
+        .arg("--model-out")
+        .arg(&model_file)
+        .output()
+        .expect("Failed to fit model");
+
+    assert!(fit.status.success());
+
+    // Simulate with multi-motif model
+    let sim2 = Command::new(get_binary_path())
+        .arg("simulate")
+        .arg("--reference")
+        .arg(&reference_path)
+        .arg("--motif")
+        .arg("GATC_6mA_1,CCWGG_5mC_1")
+        .arg("--model-in")
+        .arg(&model_file)
+        .arg("--num-reads")
+        .arg("5")
+        .arg("--read-length")
+        .arg("100")
+        .arg("--output-fastq")
+        .arg(&output_with_model)
+        .arg("--seed")
+        .arg("123")
+        .output()
+        .expect("Failed to simulate with multi-motif model");
+
+    assert!(sim2.status.success(), "Simulate with multi-motif model failed: {}",
+            String::from_utf8_lossy(&sim2.stderr));
+    assert!(output_with_model.exists());
+
+    // Verify output contains tags for both motif types
+    let content = fs::read_to_string(&output_with_model).expect("Failed to read output");
+    assert!(content.contains("MM:Z:"), "Output should contain MM tags");
 }

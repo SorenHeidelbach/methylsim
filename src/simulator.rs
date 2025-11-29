@@ -119,7 +119,7 @@ impl BuiltinSimulator {
         let length = self.length_sampler.sample(&mut self.rng);
         let template = self.sample_template(length);
         let (sequence, quality) = self.introduce_errors(&template);
-        ReadRecord::new(name, sequence, quality)
+        ReadRecord::new(name, sequence.into_bytes(), quality.into_bytes())
     }
 
     fn sample_template(&mut self, length: usize) -> String {
