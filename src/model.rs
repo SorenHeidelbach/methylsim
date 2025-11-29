@@ -350,41 +350,90 @@ fn parse_tagged_events_filtered(
     let Some(mm_tag) = mm_tag else {
         return Ok(None);
     };
-    let ml_values = parse_ml_values(ml_tag)?;
+    // Parse ML values with graceful error handling
+    let ml_values = match parse_ml_values(ml_tag) {
+        Ok(vals) => vals,
+        Err(e) => {
+            // Gracefully skip reads with bad ML tags
+            debug!("Skipping read with invalid ML tag: {}", e);
+            return Ok(None);
+        }
+    };
+
     let mut ml_iter = ml_values.into_iter();
     let segments = normalize_mm_segments(mm_tag);
     if segments.is_empty() {
         return Ok(None);
     }
+
+    let sequence = read.sequence_str();
     let mut grouped: EventMap = HashMap::new();
+    let mut total_modifications = 0;
+
     for segment in segments {
-        let Some((base, strand, mod_code, deltas)) = parse_mm_segment(&segment) else {
-            continue;
+        let (base, strand, mod_code, deltas) = match parse_mm_segment(&segment) {
+            Some(parsed) => parsed,
+            None => {
+                debug!("Skipping invalid MM segment: {}", segment);
+                continue;
+            }
         };
 
         // Check if we care about this base/strand/mod combination
         let group_key = (base, mod_code.clone(), strand);
-        let Some(target_positions) = motif_positions.get(&group_key) else {
+        let is_target_group = motif_positions.contains_key(&group_key);
+
+        // Decode positions with validation
+        let positions = match decode_positions_validated(sequence, base, &deltas, &segment) {
+            Ok(pos) => pos,
+            Err(e) => {
+                debug!("Skipping segment due to validation error: {}", e);
+                // Skip ML values for this segment
+                for _ in 0..deltas.len() {
+                    ml_iter.next();
+                }
+                continue;
+            }
+        };
+
+        total_modifications += positions.len();
+
+        if !is_target_group {
             // Skip ML values for this segment since we don't care about it
-            let positions = decode_positions(read.sequence_str(), base, &deltas);
-            for _ in positions {
+            for _ in &positions {
                 ml_iter.next();
             }
             continue;
-        };
+        }
 
-        let positions = decode_positions(read.sequence_str(), base, &deltas);
+        let target_positions = motif_positions.get(&group_key).unwrap();
+
         for pos in positions {
-            if let Some(ml) = ml_iter.next() {
-                // Only store if this position matches a motif
-                if target_positions.contains(&pos) {
-                    grouped
-                        .entry(group_key.clone())
-                        .or_default()
-                        .insert(pos, (ml as f64) / 255.0);
+            match ml_iter.next() {
+                Some(ml) => {
+                    // Only store if this position matches a motif
+                    if target_positions.contains(&pos) {
+                        grouped
+                            .entry(group_key.clone())
+                            .or_default()
+                            .insert(pos, (ml as f64) / 255.0);
+                    }
+                }
+                None => {
+                    debug!("ML tag shorter than MM events (expected more values)");
+                    break;
                 }
             }
         }
+    }
+
+    // Validate ML tag length
+    let remaining_ml = ml_iter.count();
+    if remaining_ml > 0 {
+        debug!(
+            "ML tag contains {} extra values beyond {} MM modifications",
+            remaining_ml, total_modifications
+        );
     }
     if grouped.is_empty() {
         Ok(None)
@@ -488,6 +537,65 @@ fn decode_positions(sequence: &str, base: char, deltas: &[usize]) -> Vec<usize> 
     decoded
 }
 
+/// Get canonical base positions in sequence
+fn get_canonical_positions(sequence: &str, base: char) -> Vec<usize> {
+    let target = base.to_ascii_uppercase() as u8;
+    sequence
+        .as_bytes()
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, b)| {
+            if b.to_ascii_uppercase() == target {
+                Some(idx)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// Decode positions with validation to provide better error messages
+fn decode_positions_validated(
+    sequence: &str,
+    base: char,
+    deltas: &[usize],
+    segment: &str,
+) -> Result<Vec<usize>> {
+    let positions = get_canonical_positions(sequence, base);
+
+    if positions.is_empty() {
+        bail!(
+            "MM segment for base {} but no occurrences found in sequence",
+            base
+        );
+    }
+
+    let mut decoded = Vec::new();
+    let mut cursor: isize = -1;
+
+    for delta in deltas {
+        cursor += *delta as isize + 1;
+
+        if cursor < 0 {
+            bail!("Negative modification offset encountered in MM segment: {}", segment);
+        }
+
+        let canonical_idx = cursor as usize;
+        if canonical_idx >= positions.len() {
+            bail!(
+                "MM segment for base {} references canonical index {} but only {} occurrences found",
+                base,
+                canonical_idx,
+                positions.len()
+            );
+        }
+
+        decoded.push(positions[canonical_idx]);
+    }
+
+    Ok(decoded)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -507,5 +615,35 @@ mod tests {
         let emp = EmpiricalDistribution::from_values(&values, 0.2);
         assert_eq!(emp.bins.len(), 5);
         assert_eq!(emp.bins.iter().sum::<usize>(), values.len());
+    }
+
+    #[test]
+    fn validation_detects_out_of_range_positions() {
+        let seq = "ACGT";
+        let deltas = vec![0, 10]; // Second position is way beyond what exists
+        let result = decode_positions_validated(seq, 'A', &deltas, "A+m,0,10");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("only 1 occurrences"));
+    }
+
+    #[test]
+    fn validation_detects_missing_canonical_base() {
+        let seq = "TGCT";
+        let deltas = vec![0];
+        let result = decode_positions_validated(seq, 'A', &deltas, "A+m,0");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("no occurrences found"));
+    }
+
+    #[test]
+    fn validation_succeeds_for_valid_positions() {
+        let seq = "ACGATCG";
+        // Delta 0 means modify first A (pos 0), delta 0 means skip 0 and modify next A (pos 3)
+        let deltas = vec![0, 0];
+        let result = decode_positions_validated(seq, 'A', &deltas, "A+a,0,0");
+        assert!(result.is_ok(), "Expected Ok, got: {:?}", result.err());
+        let positions = result.unwrap();
+        // Should get both A positions: 0 and 3
+        assert_eq!(positions, vec![0, 3]);
     }
 }
