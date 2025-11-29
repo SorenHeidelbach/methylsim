@@ -43,6 +43,7 @@ Important global flags:
 - `--reference`: FASTA used for simulation (required unless you pass `--reads`).
 - `--reads`: FASTA/FASTQ to annotate instead of simulating.
 - `--motif` / `--motifs-file`: motif definition(s); the file form expects `motif`, `mod_type`, `mod_position` columns (CSV/TSV) matching the methylation_phasing format (bin/contig columns are ignored).
+- `--motif` / `--motifs-file`: motif definition(s); the file form expects `motif`, `mod_type`, `mod_position` columns (CSV/TSV) matching the methylation_phasing format (bin/contig columns are ignored).
 - `--seed`: RNG seed shared by the simulator and methylation tagger (default `1`).
 - `--output-fastq`: FASTQ output path (default `methylsim.fastq`).
 - `--tags-tsv`: optional TSV output containing `read_id`, `MM`, `ML`.
