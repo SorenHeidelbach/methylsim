@@ -1,9 +1,10 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use anyhow::{Result, bail};
 use rand::{Rng, SeedableRng, rngs::StdRng};
 use rand_distr::{Distribution, Normal};
 
+use crate::model::MotifSampler;
 use crate::motif::MotifDefinition;
 
 #[derive(Debug, Clone, Default)]
@@ -29,6 +30,7 @@ struct MotifGroup {
     mod_code: String,
     strand: char,
     motifs: Vec<MotifDefinition>,
+    sampler: Option<MotifSampler>,
 }
 
 pub struct MethylationTagger {
@@ -52,6 +54,7 @@ impl MethylationTagger {
         low_ml_mean: f64,
         low_ml_std: f64,
         seed: u64,
+        motif_models: Option<HashMap<String, MotifSampler>>,
     ) -> Result<Self> {
         if motifs.is_empty() {
             bail!("At least one motif definition must be provided");
@@ -86,6 +89,7 @@ impl MethylationTagger {
         } else {
             None
         };
+        let model_map = motif_models.unwrap_or_default();
         let mut grouped: BTreeMap<(char, String, char), Vec<MotifDefinition>> = BTreeMap::new();
         for motif in motifs {
             let key = (motif.canonical_base, motif.mod_code.clone(), motif.strand);
@@ -93,11 +97,17 @@ impl MethylationTagger {
         }
         let groups = grouped
             .into_iter()
-            .map(|((base, mod_code, strand), motifs)| MotifGroup {
-                canonical_base: base,
-                mod_code,
-                strand,
-                motifs,
+            .map(|((base, mod_code, strand), motifs)| {
+                let sampler = motifs
+                    .get(0)
+                    .and_then(|motif| model_map.get(&motif.model_key()).cloned());
+                MotifGroup {
+                    canonical_base: base,
+                    mod_code,
+                    strand,
+                    motifs,
+                    sampler,
+                }
             })
             .collect();
         Ok(Self {
@@ -163,9 +173,14 @@ impl MethylationTagger {
         motif_hit_count: &mut usize,
         motif_high_count: &mut usize,
     ) {
-        let (canonical_base, strand, mod_code) = {
+        let (canonical_base, strand, mod_code, sampler) = {
             let group = &self.groups[group_index];
-            (group.canonical_base, group.strand, group.mod_code.clone())
+            (
+                group.canonical_base,
+                group.strand,
+                group.mod_code.clone(),
+                group.sampler.clone(),
+            )
         };
         let target_base = canonical_base.to_ascii_uppercase() as u8;
         for (idx, base) in seq_bytes.iter().enumerate() {
@@ -174,12 +189,20 @@ impl MethylationTagger {
             }
             let is_motif = match_flags.get(idx).copied().unwrap_or(false);
             let probability = if is_motif {
-                self.motif_high_prob
+                if let Some(model) = sampler.as_ref() {
+                    model.sample_probability(&mut self.rng)
+                } else {
+                    self.motif_high_prob
+                }
             } else {
                 self.background_high_prob
             };
             let is_high = self.sample_high(probability);
-            let ml_value = self.sample_ml_value(is_high);
+            let ml_value = if is_motif && sampler.is_some() {
+                (probability * 255.0).round().clamp(0.0, 255.0) as u8
+            } else {
+                self.sample_ml_value(is_high)
+            };
             if is_motif {
                 *motif_hit_count += 1;
                 if is_high {

@@ -1,0 +1,3 @@
+motif	mod_type	mod_position
+GATC	6mA	1
+CCWGG	5mC	1

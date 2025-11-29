@@ -26,19 +26,45 @@ cd methylsim
 cargo install --path .
 ```
 
+## Testing
+Run the test suite to verify functionality:
+```bash
+cargo test
+```
+
+The test suite includes:
+- **9 unit tests** covering motif parsing, model fitting, and FASTQ handling
+- **16 integration tests** covering:
+  - CLI help messages and argument validation
+  - Read simulation with the builtin simulator
+  - Coverage-based and absolute quantity specifications
+  - Model fitting from tagged reads
+  - Using learned models for simulation
+  - Various parameter combinations (error rates, methylation probabilities, read lengths)
+  - BAM tagging workflow validation
+
+Test data is located in `tests/data/` including:
+- `test_reference.fasta` - Small reference genome for testing
+- `test_motifs.txt` - Example motif specification file
+
 ## Basic usage
-Simulate 1,000 reads with a G6mATC motif methylated:
+
+`methylsim` has two main subcommands:
+
+### 1. `simulate` - Generate or tag reads with methylation
+Simulate reads with a G6mATC motif to achieve 50x coverage:
 
 ```bash
-methylsim \
+methylsim simulate \
   --reference resources/reference.fasta \
   --motif GATC_6mA_1 \
-  --num-reads 1000 \
+  --quantity 50x \
   --read-length 5000 \
   --output-fastq results/GATC_a_1.fastq \
   --tags-tsv results/GATC_a_1_tags.tsv
 ```
 
+<<<<<<< HEAD
 Important global flags:
 - `--reference`: FASTA used for simulation (required unless you pass `--reads`).
 - `--reads`: FASTA/FASTQ to annotate instead of simulating.
@@ -47,6 +73,52 @@ Important global flags:
 - `--seed`: RNG seed shared by the simulator and methylation tagger (default `1`).
 - `--output-fastq`: FASTQ output path (default `methylsim.fastq`).
 - `--tags-tsv`: optional TSV output containing `read_id`, `MM`, `ML`.
+=======
+Or specify absolute amount of sequence (e.g., 250 million bases):
+
+```bash
+methylsim simulate \
+  --reference resources/reference.fasta \
+  --motif GATC_6mA_1 \
+  --quantity 250M \
+  --read-length 5000 \
+  --output-fastq results/GATC_a_1.fastq
+```
+
+### 2. `fit-model` - Learn methylation model from tagged reads
+Extract methylation patterns from real basecalled data:
+
+```bash
+methylsim fit-model \
+  --reads basecalled_reads.fastq \
+  --motif GATC_6mA_1 \
+  --model-out models/ecoli_gatc.json
+```
+
+Then use the learned model to simulate realistic reads:
+
+```bash
+methylsim simulate \
+  --reference resources/reference.fasta \
+  --model-in models/ecoli_gatc.json \
+  --motif GATC_6mA_1 \
+  --num-reads 1000 \
+  --output-fastq results/realistic_reads.fastq
+```
+
+### Key flags:
+- **Input modes** (choose one):
+  - `--reference`: FASTA for simulation
+  - `--reads`: Existing FASTQ/FASTA to tag
+  - `--bam-input`: BAM to tag directly (reads SEQ field, adds MM/ML tags)
+- **Motifs** (required): `--motif` or `--motifs-file`
+- **Quantity** (simulation):
+  - `--quantity 50x`: Coverage-based (50x coverage)
+  - `--quantity 250M`: Absolute bases (250 million bases)
+  - `--num-reads`: Legacy option (number of reads)
+- **Model**: `--model-in` to use learned model (optional)
+- **Output**: `--output-fastq` (FASTQ) and `--tags-tsv` (TSV table)
+>>>>>>> 125d715 (Refactor code structure for improved readability and maintainability)
 
 ## Use cases
 
@@ -54,10 +126,10 @@ Important global flags:
 Use when you need synthetic reads without installing extra tools. Provide a reference genome and describe how long the reads should be.
 
 ```bash
-methylsim \
+methylsim simulate \
   --reference references/bacteria.fa \
   --motif GATC:C:3:m \
-  --num-reads 5000 \
+  --quantity 25x \
   --read-length 4000 \
   --substitution-rate 0.03 \
   --insertion-rate 0.015 \
@@ -67,16 +139,17 @@ methylsim \
 ```
 
 Key simulator flags:
-- `--num-reads`: number of reads to emit.
-- `--read-length`, `--read-length-mean`, `--read-length-n50`: different ways to control the length distribution.
-- `--substitution-rate`, `--insertion-rate`, `--deletion-rate`: simple ONT-style error rates.
-- `--name-prefix`: prefix for read identifiers (`methylsim_000001`, … by default).
+- `--quantity`: Coverage (e.g., `25x`) or absolute bases (e.g., `100M`). Calculates number of reads automatically.
+- `--num-reads`: (Legacy) Explicit number of reads to generate.
+- `--read-length`, `--read-length-mean`, `--read-length-n50`: Different ways to control the length distribution.
+- `--substitution-rate`, `--insertion-rate`, `--deletion-rate`: Simple ONT-style error rates.
+- `--name-prefix`: Prefix for read identifiers (`methylsim_000001`, … by default).
 
 ### 2. badread-backed simulation
-Choose this when you want badread’s built-in models or coverage presets. `methylsim` still handles motif tagging and output files; it just sources sequences from badread.
+Choose this when you want badread's built-in models or coverage presets. `methylsim` still handles motif tagging and output files; it just sources sequences from badread.
 
 ```bash
-methylsim \
+methylsim simulate \
   --reference resources/reference.fasta \
   --motif CCWGG_5mC_1 \
   --simulator badreads \
@@ -97,7 +170,7 @@ If you also pass `--reads`, no simulation happens and the simulator flag is igno
 Use this path to tag reads produced by real devices or other simulators. Only motifs and `--reads` are required.
 
 ```bash
-methylsim \
+methylsim simulate \
   --reads data/real_run.fastq.gz \
   --motifs-file configs/cpg_motifs.txt \
   --motif-high-prob 0.8 \
@@ -108,7 +181,38 @@ methylsim \
 
 Notes:
 - FASTA inputs get dummy high-quality strings so they remain valid FASTQ.
-- Existing MM/ML annotations inside FASTQ headers are stripped before new ones are written.
+- Existing MM/ML annotations inside FASTQ headers are preserved in the header comment; new tags are appended.
+
+### 4. Learn and reuse methylation models
+If you already have reads with MM/ML tags (e.g., real E. coli data with `GATC_6mA_1`), you can learn the per-motif methylation probability distribution and reuse it when simulating or re-tagging reads.
+
+**Input requirements:** FASTQ reads must already carry MM/ML tags in the header (e.g., produced by ONT basecalling, `samtools fastq`, or another tool). Only FASTQ is supported for learning today; BAM/CRAM learning is not wired yet. The motifs you pass (`--motif`/`--motifs-file`) must match the MM tags, otherwise the learner will see zero sites.
+
+#### Workflow:
+
+**Step 1:** Learn from tagged reads (here: E. coli with `GATC_6mA_1`)
+```bash
+methylsim fit-model \
+  --reads data/ecoli_tagged.fastq \
+  --motif GATC_6mA_1 \
+  --model-out models/ecoli_gatc.json
+```
+- Splits ML values into methylated vs unmethylated using `--model-threshold` (probability = ML/255; default 0.5)
+- Stores an empirical histogram plus two Beta fits and the observed methylated fraction
+
+**Step 2:** Use the learned model to simulate realistic reads
+```bash
+methylsim simulate \
+  --reference references/ecoli.fa \
+  --motif GATC_6mA_1 \
+  --model-in models/ecoli_gatc.json \
+  --num-reads 500 \
+  --output-fastq results/ecoli_sim.fastq
+```
+- The learned model drives motif probabilities instead of `--motif-high-prob`
+- ML value distributions match the empirical data
+
+**Note:** If your FASTQ lacks MM/ML tags, you must tag it first (e.g., with a methylation caller or by running `methylsim simulate` in default high/low mode) before `fit-model` will learn anything.
 
 
 ## Motif definitions and methylation model
@@ -128,6 +232,7 @@ bin_1	GCWGC	1	m	256	0	palindrome	GCWGC	1	256	0
 ```
 
 
+<<<<<<< HEAD
 Example `motifs.tsv`:
 
 ```
@@ -200,12 +305,45 @@ Output:
       --output-fastq <OUTPUT_FASTQ>  Output FASTQ file [default: methylsim.fastq]
       --tags-tsv <TAGS_TSV>          Optional TSV output listing MM/ML tags per read```
 ```
+=======
+**For `simulate` command:**
+| Flag | Description |
+| --- | --- |
+| `--model-in` | Load a previously learned model JSON (from `fit-model`). Overrides simple probability parameters. |
+| `--motif-high-prob` | Probability that a motif hit is "high" methylated (default 0.95). Used when no model is loaded. |
+| `--non-motif-high-prob` | Background probability for other canonical bases (default 0.01). |
+| `--high-ml-mean`, `--high-ml-std` | Distribution parameters for ML values of methylated bases (defaults: 230, 10). |
+| `--low-ml-mean`, `--low-ml-std` | Distribution parameters for ML values of unmethylated bases (defaults: 20, 5). |
+
+**For `fit-model` command:**
+| Flag | Description |
+| --- | --- |
+| `--model-out` | Output path for learned model JSON (required). |
+| `--model-threshold` | Probability cutoff (0–1) to split methylated vs. unmethylated when fitting Betas (default 0.5). |
+
+## BAM Tagging
+
+Tag BAM files directly without intermediate files. The tool reads the SEQ field from each BAM record, applies methylation tagging, and writes MM/ML tags directly:
+
+```bash
+methylsim simulate \
+  --bam-input input.bam \
+  --bam-output output.bam \
+  --motif GATC_6mA_1
+```
+
+This workflow:
+- Reads SEQ field from each BAM record
+- Tags sequences with MM/ML based on motifs
+- Writes tagged BAM directly (no intermediate FASTQ/TSV files needed)
+- Preserves all other BAM fields and tags
+>>>>>>> 125d715 (Refactor code structure for improved readability and maintainability)
 
 ## Outputs
-- **FASTQ** (`--output-fastq`, default `methylsim.fastq`): sequences with MM/ML tags appended to the header.
-- **Tags TSV** (`--tags-tsv`): columns `read_id`, `MM`, `ML` for reuse or auditing.
-- **BAM** (`--bam-output`): written only when tagging an existing BAM/CRAM with `--bam-input`.
-- **Logging stats**: every run prints how many reads contained motif hits plus the average number of motif hits and high-methylation events per read, making it easy to catch mismatched motif definitions.
+- **FASTQ** (`--output-fastq`, default `methylsim.fastq`): Sequences with MM/ML tags appended to the header.
+- **Tags TSV** (`--tags-tsv`): Columns `read_id`, `MM`, `ML` for reuse or auditing.
+- **BAM** (`--bam-output`): Tagged BAM when using `--bam-input` (direct tagging from SEQ field).
+- **Logging stats**: Every run prints how many reads contained motif hits plus the average number of motif hits and high-methylation events per read, making it easy to catch mismatched motif definitions.
 
 ## Workflow
 - Snakemake and Pixi project files now live under `workflow/` so the Rust crate and workflow dependencies stay separate.

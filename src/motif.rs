@@ -5,6 +5,7 @@ use csv::{ReaderBuilder, StringRecord, Trim};
 
 #[derive(Debug, Clone)]
 pub struct MotifDefinition {
+    pub motif: String,
     pub canonical_base: char,
     pub canonical_offset: usize,
     pub mod_code: String,
@@ -466,6 +467,7 @@ impl MotifDefinition {
             })
             .collect::<Result<_>>()?;
         Ok(MotifDefinition {
+            motif,
             canonical_base,
             canonical_offset,
             mod_code,
@@ -501,5 +503,12 @@ impl MotifDefinition {
             }
         }
         hits
+    }
+
+    pub fn model_key(&self) -> String {
+        format!(
+            "{}_{}_{}_{}",
+            self.motif, self.mod_code, self.canonical_offset, self.strand
+        )
     }
 }
