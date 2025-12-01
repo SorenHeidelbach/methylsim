@@ -25,12 +25,32 @@ struct ModificationEvent {
     strand: char,
 }
 
+#[derive(Clone)]
+struct EventCandidate {
+    position: usize,
+    probability: f64,
+    canonical_base: char,
+    mod_code: String,
+    strand: char,
+    is_motif: bool,
+}
+
 struct MotifGroup {
     canonical_base: char,
     mod_code: String,
     strand: char,
     motifs: Vec<MotifDefinition>,
     sampler: Option<MotifSampler>,
+}
+
+fn normalize_mod_code_for_mm(code: &str) -> String {
+    let lower = code.to_ascii_lowercase();
+    match lower.as_str() {
+        "5mc" | "m" => "m".to_string(),
+        "6ma" | "a" => "a".to_string(),
+        "4mc" | "21839" => "21839".to_string(),
+        _other => code.to_string(),
+    }
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -291,25 +311,43 @@ impl MethylationTagger {
             .iter()
             .map(|b| b.to_ascii_uppercase())
             .collect();
-        let mut events = Vec::new();
-        let mut motif_hit_count = 0usize;
-        let mut motif_high_count = 0usize;
+        let mut candidates = Vec::new();
         for idx in 0..self.groups.len() {
             let match_flags =
                 Self::collect_match_flags(&self.groups[idx], sequence, seq_bytes.len());
-            self.collect_events(
-                idx,
-                &seq_bytes,
-                &match_flags,
-                &mut events,
-                &mut motif_hit_count,
-                &mut motif_high_count,
-            );
+            self.collect_events(idx, &seq_bytes, &match_flags, &mut candidates);
         }
-        if events.is_empty() {
+        if candidates.is_empty() {
             return TagResult::default();
         }
-        let mut result = self.build_tags(sequence, events);
+
+        // Deduplicate per canonical position: keep highest-probability event
+        use std::collections::HashMap;
+        let mut best: HashMap<usize, EventCandidate> = HashMap::new();
+        for cand in candidates {
+            let entry = best.entry(cand.position).or_insert_with(|| cand.clone());
+            if cand.probability > entry.probability {
+                *entry = cand;
+            }
+        }
+        let mut final_events = Vec::with_capacity(best.len());
+        let mut motif_hit_count = 0usize;
+        let mut motif_high_count = 0usize;
+        for cand in best.into_values() {
+            if cand.is_motif {
+                motif_hit_count += 1;
+                motif_high_count += 1; // all kept candidates are modified
+            }
+            final_events.push(ModificationEvent {
+                position: cand.position,
+                ml_value: (cand.probability * 255.0).round().clamp(0.0, 255.0) as u8,
+                canonical_base: cand.canonical_base,
+                mod_code: cand.mod_code,
+                strand: cand.strand,
+            });
+        }
+
+        let mut result = self.build_tags(sequence, final_events);
         result.motif_hit_count = motif_hit_count;
         result.motif_high_count = motif_high_count;
         result
@@ -332,16 +370,14 @@ impl MethylationTagger {
         group_index: usize,
         seq_bytes: &[u8],
         match_flags: &[bool],
-        events: &mut Vec<ModificationEvent>,
-        motif_hit_count: &mut usize,
-        motif_high_count: &mut usize,
+        candidates: &mut Vec<EventCandidate>,
     ) {
         let (canonical_base, strand, mod_code, sampler) = {
             let group = &self.groups[group_index];
             (
                 group.canonical_base,
                 group.strand,
-                group.mod_code.clone(),
+                normalize_mod_code_for_mm(&group.mod_code),
                 group.sampler.clone(),
             )
         };
@@ -363,22 +399,19 @@ impl MethylationTagger {
             );
             let is_modified = self.sample_high(probability);
             if is_motif {
-                *motif_hit_count += 1;
-                if is_modified {
-                    *motif_high_count += 1;
-                }
+                // stats computed after deduplication
             }
             if !is_modified {
                 continue;
             }
 
-            let ml_value = (probability * 255.0).round().clamp(0.0, 255.0) as u8;
-            events.push(ModificationEvent {
+            candidates.push(EventCandidate {
                 position: idx,
-                ml_value,
+                probability,
                 canonical_base,
                 mod_code: mod_code.clone(),
                 strand,
+                is_motif,
             });
         }
     }
@@ -403,7 +436,26 @@ impl MethylationTagger {
                 .push((event.position, event.ml_value));
         }
         let mut grouped: Vec<_> = groups.into_iter().collect();
-        grouped.sort_by_key(|(_, evts)| evts.iter().map(|(pos, _)| *pos).min().unwrap_or(0));
+        grouped.sort_by(|(key_a, ev_a), (key_b, ev_b)| {
+            let (base_a, mod_a, _) = key_a;
+            let (base_b, mod_b, _) = key_b;
+            base_a.cmp(base_b).then(mod_a.cmp(mod_b)).then(
+                ev_a.iter()
+                    .map(|(pos, _)| *pos)
+                    .min()
+                    .unwrap_or(0)
+                    .cmp(&ev_b.iter().map(|(pos, _)| *pos).min().unwrap_or(0)),
+            )
+        });
+
+        // If multiple mod codes share the same base/strand, use explicit skip mode ('?') to avoid inference conflicts
+        let mut base_counts: std::collections::HashMap<(char, char), usize> =
+            std::collections::HashMap::new();
+        for ((base, _, strand), evts) in &grouped {
+            if !evts.is_empty() {
+                *base_counts.entry((*base, *strand)).or_insert(0) += 1;
+            }
+        }
         let seq_bytes: Vec<u8> = sequence
             .as_bytes()
             .iter()
@@ -448,12 +500,17 @@ impl MethylationTagger {
             }
 
             if !deltas.is_empty() {
+                let skip_char = if base_counts.get(&(base, strand)).copied().unwrap_or(0) > 1 {
+                    '?'
+                } else {
+                    '.'
+                };
                 let delta_str = deltas
                     .iter()
                     .map(|d| d.to_string())
                     .collect::<Vec<_>>()
                     .join(",");
-                mm_segments.push(format!("{base}{strand}{mod_code}.,{delta_str};"));
+                mm_segments.push(format!("{base}{strand}{mod_code}{skip_char},{delta_str};"));
             }
         }
 
