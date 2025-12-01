@@ -6,11 +6,15 @@ use anyhow::{Context, Result, anyhow, bail};
 use log::{info, debug};
 use rand::Rng;
 use rand::rngs::StdRng;
+use rand::Rng;
 use rand_distr::{Beta, Distribution};
 use serde::{Deserialize, Serialize};
 
-use crate::fastx::{ReadRecord, process_fastq_streaming};
+use crate::fastx::{process_fastq_streaming, ReadRecord};
 use crate::motif::MotifDefinition;
+
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+pub struct ModelKey(String);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BetaParams {
@@ -32,7 +36,8 @@ pub struct MotifModel {
     pub canonical_base: char,
     pub canonical_offset: usize,
     pub mod_code: String,
-    pub strand: char,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strand: Option<char>,
     pub total_sites: usize,
     pub covered_sites: usize,
     pub methylated_fraction: f64,
@@ -59,6 +64,27 @@ type EventMap = HashMap<(char, String, char), HashMap<usize, f64>>;
 
 const MAX_PARSE_WARNINGS: usize = 20;
 
+impl ModelKey {
+    pub fn normalize(raw: &str) -> Self {
+        if let Some(stripped) = raw.strip_suffix("_+") {
+            return ModelKey(stripped.to_string());
+        }
+        if let Some(stripped) = raw.strip_suffix("_-") {
+            return ModelKey(stripped.to_string());
+        }
+        ModelKey(raw.to_string())
+    }
+
+    #[allow(dead_code)]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn into_string(self) -> String {
+        self.0
+    }
+}
+
 struct ParseWarningTracker {
     count: usize,
     max_warnings: usize,
@@ -74,7 +100,10 @@ impl ParseWarningTracker {
 
     fn record_failure(&mut self, read_id: &str, error: &anyhow::Error) {
         if self.count < self.max_warnings {
-            eprintln!("warning: failed to parse modifications for read {}: {}", read_id, error);
+            eprintln!(
+                "warning: failed to parse modifications for read {}: {}",
+                read_id, error
+            );
         } else if self.count == self.max_warnings {
             eprintln!("warning: additional modification parse failures suppressed");
         }
@@ -114,6 +143,7 @@ pub fn learn_model_from_reads(
     reads_path: &Path,
     motifs: &[MotifDefinition],
     threshold: f64,
+    max_reads: Option<usize>,
 ) -> Result<LearnedModel> {
     if !(0.0..=1.0).contains(&threshold) {
         bail!("Model threshold must be between 0 and 1 (received {threshold})");
@@ -134,7 +164,7 @@ pub fn learn_model_from_reads(
     let mut warning_tracker = ParseWarningTracker::new();
 
     // Process reads in streaming fashion to minimize memory usage
-    process_fastq_streaming(reads_path, true, |read| {
+    process_fastq_streaming(reads_path, true, max_reads, |read| {
         total_reads += 1;
 
         // Find all motif positions in this read first
@@ -258,10 +288,18 @@ pub fn learn_model_from_reads(
         };
         info!(
             "  {} ({}): {} total sites, {} covered ({:.1}%), {:.1}% methylated",
-            motif.motif, key, total_sites, covered.len(), coverage_pct, methylated_fraction * 100.0
+            motif.motif,
+            key,
+            total_sites,
+            covered.len(),
+            coverage_pct,
+            methylated_fraction * 100.0
         );
-        debug!("    Methylated: {} sites, Unmethylated: {} sites",
-               methylated.len(), unmethylated.len());
+        debug!(
+            "    Methylated: {} sites, Unmethylated: {} sites",
+            methylated.len(),
+            unmethylated.len()
+        );
 
         motif_models.push(MotifModel {
             key,
@@ -269,7 +307,7 @@ pub fn learn_model_from_reads(
             canonical_base: motif.canonical_base,
             canonical_offset: motif.canonical_offset,
             mod_code: motif.mod_code.clone(),
-            strand: motif.strand,
+            strand: None,
             total_sites,
             covered_sites: covered.len(),
             methylated_fraction,
@@ -294,8 +332,8 @@ impl LearnedModel {
             .map(|m| {
                 // Format: motif:canonical:offset:mod:strand
                 format!(
-                    "{}:{}:{}:{}:{}",
-                    m.motif, m.canonical_base, m.canonical_offset, m.mod_code, m.strand
+                    "{}:{}:{}:{}",
+                    m.motif, m.canonical_base, m.canonical_offset, m.mod_code
                 )
             })
             .collect()
@@ -318,6 +356,7 @@ impl LearnedModel {
     pub fn build_samplers(&self) -> Result<HashMap<String, MotifSampler>> {
         let mut map = HashMap::new();
         for motif in &self.motifs {
+            let key = ModelKey::normalize(&motif.key);
             let meth_params = motif.methylated_beta.clone().unwrap_or(BetaParams {
                 alpha: 1.0,
                 beta: 1.0,
@@ -338,7 +377,7 @@ impl LearnedModel {
                 )?;
             let fraction = motif.methylated_fraction.clamp(0.0, 1.0);
             map.insert(
-                motif.key.clone(),
+                key.into_string(),
                 MotifSampler {
                     methylated_fraction: fraction,
                     methylated_beta,
@@ -493,7 +532,10 @@ fn parse_tagged_events_filtered(
                     }
                 }
                 None => {
-                    bail!("ML tag has fewer values than MM modifications (expected at least {} more)", total_modifications - (ml_iter.len() + 1));
+                    bail!(
+                        "ML tag has fewer values than MM modifications (expected at least {} more)",
+                        total_modifications - (ml_iter.len() + 1)
+                    );
                 }
             }
         }
@@ -517,7 +559,8 @@ fn parse_tagged_events_filtered(
     if remaining_ml > 0 {
         bail!(
             "ML tag contains {} extra values beyond {} MM modifications",
-            remaining_ml, total_modifications
+            remaining_ml,
+            total_modifications
         );
     }
     if grouped.is_empty() {
@@ -621,6 +664,7 @@ fn parse_mm_segment(segment: &str) -> Option<(char, char, String, Vec<usize>, Sk
     Some((base, strand, mod_code, deltas, skip_mode))
 }
 
+#[allow(dead_code)]
 fn decode_positions(sequence: &str, base: char, deltas: &[usize]) -> Vec<usize> {
     let seq_bytes: Vec<u8> = sequence
         .as_bytes()
@@ -689,7 +733,10 @@ fn decode_positions_validated(
         cursor += *delta as isize + 1;
 
         if cursor < 0 {
-            bail!("Negative modification offset encountered in MM segment: {}", segment);
+            bail!(
+                "Negative modification offset encountered in MM segment: {}",
+                segment
+            );
         }
 
         let canonical_idx = cursor as usize;
@@ -735,7 +782,10 @@ mod tests {
         let deltas = vec![0, 10]; // Second position is way beyond what exists
         let result = decode_positions_validated(seq, 'A', &deltas, "A+m,0,10");
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("only 1 occurrences"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("only 1 occurrences"));
     }
 
     #[test]
@@ -744,7 +794,10 @@ mod tests {
         let deltas = vec![0];
         let result = decode_positions_validated(seq, 'A', &deltas, "A+m,0");
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("no occurrences found"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("no occurrences found"));
     }
 
     #[test]

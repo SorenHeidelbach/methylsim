@@ -2,14 +2,38 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{anyhow, bail, Context, Result};
 use rand::seq::SliceRandom;
-use rand::{Rng, SeedableRng, rngs::StdRng};
+use rand::{rngs::StdRng, Rng, SeedableRng};
 use rand_distr::{Distribution, Exp};
 use shell_words::split as shell_split;
 use tempfile::tempdir;
 
-use crate::fastx::{ReadRecord, read_fasta_sequences, read_fastq_records};
+use crate::fastx::{read_fasta_sequences, read_fastq_records, ReadRecord};
+
+#[derive(Clone, Debug)]
+pub struct BuiltinSimulationConfig {
+    pub references: Vec<String>,
+    pub profile: ErrorProfile,
+    pub length_spec: ReadLengthSpec,
+    pub num_reads: usize,
+    pub name_prefix: String,
+    pub seed: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct BadreadsSimulationConfig {
+    pub reference: PathBuf,
+    pub num_reads: usize,
+    pub read_length: usize,
+    pub executable: Option<PathBuf>,
+    pub extra_args: Option<String>,
+    pub seed: u64,
+}
+
+pub trait SimulatorStrategy {
+    fn simulate(&mut self) -> Result<Vec<ReadRecord>>;
+}
 
 #[derive(Copy, Clone, Debug)]
 pub struct ErrorProfile {
@@ -87,6 +111,20 @@ pub fn run_badreads(
     }
     let reads = read_fastq_records(&fastq_path)?;
     Ok(reads)
+}
+
+pub enum SimulatorKindStrategy {
+    Builtin(BuiltinStrategy),
+    Badreads(BadreadsStrategy),
+}
+
+impl SimulatorStrategy for SimulatorKindStrategy {
+    fn simulate(&mut self) -> Result<Vec<ReadRecord>> {
+        match self {
+            SimulatorKindStrategy::Builtin(inner) => inner.simulate(),
+            SimulatorKindStrategy::Badreads(inner) => inner.simulate(),
+        }
+    }
 }
 
 pub struct BuiltinSimulator {
@@ -187,6 +225,73 @@ impl BuiltinSimulator {
     fn quality_char(mutated: bool) -> char {
         let phred = if mutated { 18 } else { 38 };
         (phred + 33) as u8 as char
+    }
+}
+
+pub struct BuiltinStrategy {
+    simulator: BuiltinSimulator,
+    num_reads: usize,
+    name_prefix: String,
+}
+
+impl BuiltinStrategy {
+    pub fn new(config: BuiltinSimulationConfig) -> Result<Self> {
+        let simulator = BuiltinSimulator::new(
+            config.references,
+            config.profile,
+            config.length_spec,
+            config.seed,
+        )?;
+        Ok(Self {
+            simulator,
+            num_reads: config.num_reads,
+            name_prefix: config.name_prefix,
+        })
+    }
+}
+
+impl SimulatorStrategy for BuiltinStrategy {
+    fn simulate(&mut self) -> Result<Vec<ReadRecord>> {
+        let mut reads = Vec::with_capacity(self.num_reads);
+        let progress_interval = (self.num_reads / 10).max(1).min(1000);
+        for idx in 0..self.num_reads {
+            let name = format!("{}_{}", self.name_prefix, format!("{:06}", idx + 1));
+            let read = self.simulator.generate_read(name);
+            if (idx + 1) % progress_interval == 0 || idx + 1 == self.num_reads {
+                let pct = (idx + 1) as f64 / self.num_reads as f64 * 100.0;
+                log::info!(
+                    "Progress: {}/{} reads ({:.1}%)",
+                    idx + 1,
+                    self.num_reads,
+                    pct
+                );
+            }
+            reads.push(read);
+        }
+        Ok(reads)
+    }
+}
+
+pub struct BadreadsStrategy {
+    config: BadreadsSimulationConfig,
+}
+
+impl BadreadsStrategy {
+    pub fn new(config: BadreadsSimulationConfig) -> Self {
+        Self { config }
+    }
+}
+
+impl SimulatorStrategy for BadreadsStrategy {
+    fn simulate(&mut self) -> Result<Vec<ReadRecord>> {
+        run_badreads(
+            &self.config.reference,
+            self.config.num_reads,
+            Some(self.config.read_length),
+            self.config.executable.as_ref(),
+            self.config.extra_args.as_deref(),
+            Some(self.config.seed),
+        )
     }
 }
 

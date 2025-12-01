@@ -1,8 +1,8 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
-use anyhow::{Result, bail};
-use rand::{Rng, SeedableRng, rngs::StdRng};
-use rand_distr::{Distribution, Normal};
+use anyhow::{bail, Result};
+use rand::{rngs::StdRng, Rng, SeedableRng};
+use rand_distr::{Beta, Distribution};
 
 use crate::model::MotifSampler;
 use crate::motif::MotifDefinition;
@@ -33,65 +33,197 @@ struct MotifGroup {
     sampler: Option<MotifSampler>,
 }
 
-pub struct MethylationTagger {
-    groups: Vec<MotifGroup>,
-    motif_high_prob: f64,
-    background_high_prob: f64,
-    rng: StdRng,
-    high_ml_mean: f64,
-    high_ml_normal: Option<Normal<f64>>,
-    low_ml_mean: f64,
-    low_ml_normal: Option<Normal<f64>>,
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum SiteKind {
+    Motif,
+    Background,
 }
 
-impl MethylationTagger {
-    pub fn new(
-        motifs: Vec<MotifDefinition>,
+pub trait ProbabilitySampler {
+    fn sample_probability(
+        &mut self,
+        site: SiteKind,
+        model_sampler: Option<&MotifSampler>,
+        mod_code: &str,
+        rng: &mut StdRng,
+    ) -> f64;
+}
+
+struct MixtureProbabilitySampler {
+    high_beta: Beta<f64>,
+    low_betas: HashMap<String, Beta<f64>>,
+    default_low_beta: Beta<f64>,
+    motif_high_prob: f64,
+    background_high_prob: f64,
+}
+
+impl MixtureProbabilitySampler {
+    fn new(
+        high_beta: Beta<f64>,
+        low_betas: HashMap<String, Beta<f64>>,
+        default_low_beta: Beta<f64>,
         motif_high_prob: f64,
         background_high_prob: f64,
-        high_ml_mean: f64,
-        high_ml_std: f64,
-        low_ml_mean: f64,
-        low_ml_std: f64,
-        seed: u64,
-        motif_models: Option<HashMap<String, MotifSampler>>,
-    ) -> Result<Self> {
-        if motifs.is_empty() {
+    ) -> Self {
+        Self {
+            high_beta,
+            low_betas,
+            default_low_beta,
+            motif_high_prob,
+            background_high_prob,
+        }
+    }
+}
+
+pub struct MethylationTagger {
+    groups: Vec<MotifGroup>,
+    probability_sampler: Box<dyn ProbabilitySampler + Send>,
+    rng: StdRng,
+}
+
+#[derive(Clone, Debug)]
+struct DefaultBetas {
+    high: (f64, f64),
+    fallback_low: (f64, f64),
+    mod_low: HashMap<String, (f64, f64)>,
+}
+
+impl Default for DefaultBetas {
+    fn default() -> Self {
+        let high = (2.8685813093772063, 0.055071333309938346);
+        let fallback_low = (2.460887754108385, 6.6833122937987115); // 6mA defaults
+
+        let mut mod_low = HashMap::new();
+        // Adenine methylation (6mA)
+        mod_low.insert("a".to_string(), (2.460887754108385, 6.6833122937987115));
+        mod_low.insert("6ma".to_string(), (2.460887754108385, 6.6833122937987115));
+        // Cytosine methylation (5mC / 4mC)
+        mod_low.insert("m".to_string(), (1.9849538027481268, 5.590529733150861));
+        mod_low.insert("5mc".to_string(), (1.9849538027481268, 5.590529733150861));
+        mod_low.insert("4mc".to_string(), (1.9849538027481268, 5.590529733150861));
+        mod_low.insert("c".to_string(), (1.9849538027481268, 5.590529733150861));
+
+        Self {
+            high,
+            fallback_low,
+            mod_low,
+        }
+    }
+}
+
+impl DefaultBetas {
+    fn high(&self) -> (f64, f64) {
+        self.high
+    }
+
+    fn low_for(&self, mod_code: &str, fallback: (f64, f64)) -> (f64, f64) {
+        let key = mod_code.to_ascii_lowercase();
+        self.mod_low.get(&key).copied().unwrap_or(fallback)
+    }
+
+    fn fallback_low(&self) -> (f64, f64) {
+        self.fallback_low
+    }
+}
+
+pub struct MethylationTaggerBuilder {
+    motifs: Vec<MotifDefinition>,
+    motif_high_prob: f64,
+    background_high_prob: f64,
+    sampler_map: Option<HashMap<String, MotifSampler>>,
+    seed: u64,
+    high_beta_alpha: f64,
+    high_beta_beta: f64,
+    low_beta_alpha: f64,
+    low_beta_beta: f64,
+}
+
+impl MethylationTaggerBuilder {
+    pub fn new(motifs: Vec<MotifDefinition>) -> Self {
+        Self {
+            motifs,
+            motif_high_prob: 0.95,
+            background_high_prob: 0.01,
+            sampler_map: None,
+            seed: 1,
+            high_beta_alpha: DefaultBetas::default().high().0,
+            high_beta_beta: DefaultBetas::default().high().1,
+            low_beta_alpha: DefaultBetas::default().fallback_low().0,
+            low_beta_beta: DefaultBetas::default().fallback_low().1,
+        }
+    }
+
+    pub fn with_probs(mut self, motif_high: f64, background_high: f64) -> Self {
+        self.motif_high_prob = motif_high;
+        self.background_high_prob = background_high;
+        self
+    }
+
+    pub fn with_sampler_map(mut self, sampler_map: Option<HashMap<String, MotifSampler>>) -> Self {
+        self.sampler_map = sampler_map;
+        self
+    }
+
+    pub fn with_betas(
+        mut self,
+        high_alpha: f64,
+        high_beta: f64,
+        low_alpha: f64,
+        low_beta: f64,
+    ) -> Self {
+        self.high_beta_alpha = high_alpha;
+        self.high_beta_beta = high_beta;
+        self.low_beta_alpha = low_alpha;
+        self.low_beta_beta = low_beta;
+        self
+    }
+
+    pub fn with_seed(mut self, seed: u64) -> Self {
+        self.seed = seed;
+        self
+    }
+
+    pub fn build(self) -> Result<MethylationTagger> {
+        if self.motifs.is_empty() {
             bail!("At least one motif definition must be provided");
         }
-        if !(0.0..=1.0).contains(&motif_high_prob) {
-            bail!("Motif high probability must be between 0 and 1 (received {motif_high_prob})");
-        }
-        if !(0.0..=1.0).contains(&background_high_prob) {
+        if !(0.0..=1.0).contains(&self.motif_high_prob) {
             bail!(
-                "Background high probability must be between 0 and 1 (received {background_high_prob})"
+                "Motif high probability must be between 0 and 1 (received {})",
+                self.motif_high_prob
             );
         }
-        if !(0.0..=255.0).contains(&high_ml_mean) {
-            bail!("High ML mean must be between 0 and 255 (received {high_ml_mean})");
+        if !(0.0..=1.0).contains(&self.background_high_prob) {
+            bail!(
+                "Background high probability must be between 0 and 1 (received {})",
+                self.background_high_prob
+            );
         }
-        if high_ml_std.is_sign_negative() {
-            bail!("High ML standard deviation must be non-negative");
+
+        let defaults = DefaultBetas::default();
+        let high_beta = build_beta(self.high_beta_alpha, self.high_beta_beta)?;
+        let mut low_betas: HashMap<String, Beta<f64>> = HashMap::new();
+        for motif in &self.motifs {
+            let params =
+                defaults.low_for(&motif.mod_code, (self.low_beta_alpha, self.low_beta_beta));
+            low_betas
+                .entry(motif.mod_code.clone())
+                .or_insert(build_beta(params.0, params.1)?);
         }
-        if !(0.0..=255.0).contains(&low_ml_mean) {
-            bail!("Low ML mean must be between 0 and 255 (received {low_ml_mean})");
-        }
-        if low_ml_std.is_sign_negative() {
-            bail!("Low ML standard deviation must be non-negative");
-        }
-        let high_ml_normal = if high_ml_std > 0.0 {
-            Some(Normal::new(high_ml_mean, high_ml_std)?)
-        } else {
-            None
-        };
-        let low_ml_normal = if low_ml_std > 0.0 {
-            Some(Normal::new(low_ml_mean, low_ml_std)?)
-        } else {
-            None
-        };
-        let model_map = motif_models.unwrap_or_default();
+        let default_low_beta = build_beta(self.low_beta_alpha, self.low_beta_beta)?;
+
+        let probability_sampler: Box<dyn ProbabilitySampler + Send> =
+            Box::new(MixtureProbabilitySampler::new(
+                high_beta,
+                low_betas,
+                default_low_beta,
+                self.motif_high_prob,
+                self.background_high_prob,
+            ));
+
+        let model_map = self.sampler_map.unwrap_or_default();
         let mut grouped: BTreeMap<(char, String, char), Vec<MotifDefinition>> = BTreeMap::new();
-        for motif in motifs {
+        for motif in self.motifs {
             let key = (motif.canonical_base, motif.mod_code.clone(), motif.strand);
             grouped.entry(key).or_default().push(motif);
         }
@@ -110,16 +242,39 @@ impl MethylationTagger {
                 }
             })
             .collect();
-        Ok(Self {
+
+        Ok(MethylationTagger {
             groups,
-            motif_high_prob,
-            background_high_prob,
-            rng: StdRng::seed_from_u64(seed),
-            high_ml_mean,
-            high_ml_normal,
-            low_ml_mean,
-            low_ml_normal,
+            probability_sampler,
+            rng: StdRng::seed_from_u64(self.seed),
         })
+    }
+}
+
+impl MethylationTagger {
+    #[allow(dead_code)]
+    pub fn new(
+        motifs: Vec<MotifDefinition>,
+        motif_high_prob: f64,
+        background_high_prob: f64,
+        high_beta_alpha: f64,
+        high_beta_beta: f64,
+        low_beta_alpha: f64,
+        low_beta_beta: f64,
+        seed: u64,
+        motif_models: Option<HashMap<String, MotifSampler>>,
+    ) -> Result<Self> {
+        MethylationTaggerBuilder::new(motifs)
+            .with_probs(motif_high_prob, background_high_prob)
+            .with_betas(
+                high_beta_alpha,
+                high_beta_beta,
+                low_beta_alpha,
+                low_beta_beta,
+            )
+            .with_seed(seed)
+            .with_sampler_map(motif_models)
+            .build()
     }
 
     pub fn annotate(&mut self, sequence: &str) -> TagResult {
@@ -188,21 +343,18 @@ impl MethylationTagger {
                 continue;
             }
             let is_motif = match_flags.get(idx).copied().unwrap_or(false);
-            let probability = if is_motif {
-                if let Some(model) = sampler.as_ref() {
-                    model.sample_probability(&mut self.rng)
+            let probability = self.probability_sampler.sample_probability(
+                if is_motif {
+                    SiteKind::Motif
                 } else {
-                    self.motif_high_prob
-                }
-            } else {
-                self.background_high_prob
-            };
+                    SiteKind::Background
+                },
+                sampler.as_ref(),
+                &mod_code,
+                &mut self.rng,
+            );
             let is_high = self.sample_high(probability);
-            let ml_value = if is_motif && sampler.is_some() {
-                (probability * 255.0).round().clamp(0.0, 255.0) as u8
-            } else {
-                self.sample_ml_value(is_high)
-            };
+            let ml_value = (probability * 255.0).round().clamp(0.0, 255.0) as u8;
             if is_motif {
                 *motif_hit_count += 1;
                 if is_high {
@@ -227,20 +379,6 @@ impl MethylationTagger {
         } else {
             self.rng.gen_bool(probability)
         }
-    }
-
-    fn sample_ml_value(&mut self, is_high: bool) -> u8 {
-        let (mean, normal) = if is_high {
-            (self.high_ml_mean, self.high_ml_normal.as_ref())
-        } else {
-            (self.low_ml_mean, self.low_ml_normal.as_ref())
-        };
-        let value = if let Some(dist) = normal {
-            dist.sample(&mut self.rng)
-        } else {
-            mean
-        };
-        value.clamp(0.0, 255.0).round() as u8
     }
 
     fn build_tags(&mut self, sequence: &str, events: Vec<ModificationEvent>) -> TagResult {
@@ -330,5 +468,36 @@ impl MethylationTagger {
                 motif_high_count: 0,
             }
         }
+    }
+}
+
+fn build_beta(alpha: f64, beta: f64) -> Result<Beta<f64>> {
+    Ok(Beta::new(alpha.max(1e-6), beta.max(1e-6))?)
+}
+
+impl ProbabilitySampler for MixtureProbabilitySampler {
+    fn sample_probability(
+        &mut self,
+        site: SiteKind,
+        model_sampler: Option<&MotifSampler>,
+        mod_code: &str,
+        rng: &mut StdRng,
+    ) -> f64 {
+        if let Some(model) = model_sampler {
+            return model.sample_probability(rng);
+        }
+        let pick_high = match site {
+            SiteKind::Motif => rng.gen_bool(self.motif_high_prob.clamp(0.0, 1.0)),
+            SiteKind::Background => rng.gen_bool(self.background_high_prob.clamp(0.0, 1.0)),
+        };
+        let prob = if pick_high {
+            self.high_beta.sample(rng)
+        } else {
+            self.low_betas
+                .get(mod_code)
+                .unwrap_or(&self.default_low_beta)
+                .sample(rng)
+        };
+        prob.clamp(0.0, 1.0)
     }
 }

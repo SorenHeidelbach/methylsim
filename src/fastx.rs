@@ -97,6 +97,7 @@ pub fn read_fasta_sequences(path: &Path) -> Result<Vec<String>> {
         .collect())
 }
 
+#[allow(dead_code)]
 pub fn read_fastx_with_progress(path: &Path, show_progress: bool) -> Result<Vec<ReadRecord>> {
     match detect_format(path)? {
         FastxFormat::Fasta => read_fasta_records(path),
@@ -162,7 +163,10 @@ pub fn read_fastq_records(path: &Path) -> Result<Vec<ReadRecord>> {
     read_fastq_records_with_progress(path, false)
 }
 
-pub fn read_fastq_records_with_progress(path: &Path, show_progress: bool) -> Result<Vec<ReadRecord>> {
+pub fn read_fastq_records_with_progress(
+    path: &Path,
+    show_progress: bool,
+) -> Result<Vec<ReadRecord>> {
     let file = File::open(path)
         .with_context(|| format!("Failed to open FASTQ file '{}'", path.display()))?;
     let mut reader = BufReader::with_capacity(64 * 1024, file);
@@ -178,7 +182,8 @@ pub fn read_fastq_records_with_progress(path: &Path, show_progress: bool) -> Res
     loop {
         // Read header line
         header.clear();
-        let bytes_read = reader.read_line(&mut header)
+        let bytes_read = reader
+            .read_line(&mut header)
             .with_context(|| format!("Failed reading FASTQ from '{}'", path.display()))?;
 
         if bytes_read == 0 {
@@ -220,26 +225,60 @@ pub fn read_fastq_records_with_progress(path: &Path, show_progress: bool) -> Res
 
         // Read sequence line
         sequence.clear();
-        if reader.read_line(&mut sequence)
-            .with_context(|| format!("Failed reading sequence for '{}' in '{}'", name, path.display()))? == 0 {
-            bail!("Unexpected EOF while reading sequence for '{}' in '{}'", name, path.display());
+        if reader.read_line(&mut sequence).with_context(|| {
+            format!(
+                "Failed reading sequence for '{}' in '{}'",
+                name,
+                path.display()
+            )
+        })? == 0
+        {
+            bail!(
+                "Unexpected EOF while reading sequence for '{}' in '{}'",
+                name,
+                path.display()
+            );
         }
 
         // Read '+' separator line
         plus.clear();
-        if reader.read_line(&mut plus)
-            .with_context(|| format!("Failed reading separator for '{}' in '{}'", name, path.display()))? == 0 {
-            bail!("Unexpected EOF while reading separator for '{}' in '{}'", name, path.display());
+        if reader.read_line(&mut plus).with_context(|| {
+            format!(
+                "Failed reading separator for '{}' in '{}'",
+                name,
+                path.display()
+            )
+        })? == 0
+        {
+            bail!(
+                "Unexpected EOF while reading separator for '{}' in '{}'",
+                name,
+                path.display()
+            );
         }
         if !plus.starts_with('+') {
-            bail!("Invalid FASTQ separator (expected '+') for '{}' in '{}'", name, path.display());
+            bail!(
+                "Invalid FASTQ separator (expected '+') for '{}' in '{}'",
+                name,
+                path.display()
+            );
         }
 
         // Read quality line
         quality.clear();
-        if reader.read_line(&mut quality)
-            .with_context(|| format!("Failed reading quality for '{}' in '{}'", name, path.display()))? == 0 {
-            bail!("Unexpected EOF while reading quality for '{}' in '{}'", name, path.display());
+        if reader.read_line(&mut quality).with_context(|| {
+            format!(
+                "Failed reading quality for '{}' in '{}'",
+                name,
+                path.display()
+            )
+        })? == 0
+        {
+            bail!(
+                "Unexpected EOF while reading quality for '{}' in '{}'",
+                name,
+                path.display()
+            );
         }
 
         // Convert to bytes and uppercase sequence
@@ -264,7 +303,9 @@ pub fn read_fastq_records_with_progress(path: &Path, show_progress: bool) -> Res
             base.make_ascii_uppercase();
         }
 
-        records.push(ReadRecord::with_comment(name, comment, seq_bytes, qual_bytes));
+        records.push(ReadRecord::with_comment(
+            name, comment, seq_bytes, qual_bytes,
+        ));
 
         record_count += 1;
         if show_progress && record_count % PROGRESS_INTERVAL == 0 {
@@ -283,7 +324,12 @@ pub fn read_fastq_records_with_progress(path: &Path, show_progress: bool) -> Res
 }
 
 /// Process FASTQ records one at a time using a callback, minimizing memory usage
-pub fn process_fastq_streaming<F>(path: &Path, show_progress: bool, mut callback: F) -> Result<()>
+pub fn process_fastq_streaming<F>(
+    path: &Path,
+    show_progress: bool,
+    max_records: Option<usize>,
+    mut callback: F,
+) -> Result<()>
 where
     F: FnMut(&ReadRecord) -> Result<()>,
 {
@@ -301,7 +347,8 @@ where
     loop {
         // Read header line
         header.clear();
-        let bytes_read = reader.read_line(&mut header)
+        let bytes_read = reader
+            .read_line(&mut header)
             .with_context(|| format!("Failed reading FASTQ from '{}'", path.display()))?;
 
         if bytes_read == 0 {
@@ -343,26 +390,60 @@ where
 
         // Read sequence line
         sequence.clear();
-        if reader.read_line(&mut sequence)
-            .with_context(|| format!("Failed reading sequence for '{}' in '{}'", name, path.display()))? == 0 {
-            bail!("Unexpected EOF while reading sequence for '{}' in '{}'", name, path.display());
+        if reader.read_line(&mut sequence).with_context(|| {
+            format!(
+                "Failed reading sequence for '{}' in '{}'",
+                name,
+                path.display()
+            )
+        })? == 0
+        {
+            bail!(
+                "Unexpected EOF while reading sequence for '{}' in '{}'",
+                name,
+                path.display()
+            );
         }
 
         // Read '+' separator line
         plus.clear();
-        if reader.read_line(&mut plus)
-            .with_context(|| format!("Failed reading separator for '{}' in '{}'", name, path.display()))? == 0 {
-            bail!("Unexpected EOF while reading separator for '{}' in '{}'", name, path.display());
+        if reader.read_line(&mut plus).with_context(|| {
+            format!(
+                "Failed reading separator for '{}' in '{}'",
+                name,
+                path.display()
+            )
+        })? == 0
+        {
+            bail!(
+                "Unexpected EOF while reading separator for '{}' in '{}'",
+                name,
+                path.display()
+            );
         }
         if !plus.starts_with('+') {
-            bail!("Invalid FASTQ separator (expected '+') for '{}' in '{}'", name, path.display());
+            bail!(
+                "Invalid FASTQ separator (expected '+') for '{}' in '{}'",
+                name,
+                path.display()
+            );
         }
 
         // Read quality line
         quality.clear();
-        if reader.read_line(&mut quality)
-            .with_context(|| format!("Failed reading quality for '{}' in '{}'", name, path.display()))? == 0 {
-            bail!("Unexpected EOF while reading quality for '{}' in '{}'", name, path.display());
+        if reader.read_line(&mut quality).with_context(|| {
+            format!(
+                "Failed reading quality for '{}' in '{}'",
+                name,
+                path.display()
+            )
+        })? == 0
+        {
+            bail!(
+                "Unexpected EOF while reading quality for '{}' in '{}'",
+                name,
+                path.display()
+            );
         }
 
         // Convert to bytes and uppercase sequence
@@ -393,6 +474,11 @@ where
         callback(&record)?;
 
         record_count += 1;
+        if let Some(max) = max_records {
+            if record_count >= max {
+                break;
+            }
+        }
         if show_progress && record_count % PROGRESS_INTERVAL == 0 {
             eprint!("\rProcessed {} records...", record_count);
         }

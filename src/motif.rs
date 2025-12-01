@@ -1,6 +1,6 @@
 use std::{collections::HashMap, fs, path::Path};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{anyhow, bail, Context, Result};
 use csv::{ReaderBuilder, StringRecord, Trim};
 
 #[derive(Debug, Clone)]
@@ -506,9 +506,6 @@ impl MotifDefinition {
     }
 
     pub fn model_key(&self) -> String {
-        format!(
-            "{}_{}_{}_{}",
-            self.motif, self.mod_code, self.canonical_offset, self.strand
-        )
+        format!("{}_{}_{}", self.motif, self.mod_code, self.canonical_offset)
     }
 }

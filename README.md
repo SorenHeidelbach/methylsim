@@ -70,6 +70,16 @@ methylsim fit-model \
   --model-out models/ecoli_gatc.json
 ```
 
+To speed up exploratory runs, you can limit fitting to the first N reads:
+
+```bash
+methylsim fit-model \
+  --reads basecalled_reads.fastq \
+  --motif GATC_6mA_1 \
+  --model-out models/ecoli_gatc.json \
+  --n-reads 1000
+```
+
 Then use the learned model to simulate realistic reads:
 
 ```bash
@@ -196,8 +206,8 @@ methylsim fit-model \
 The tool will print per-motif statistics:
 ```
 Fitting model for 2 motif(s):
-  GATC (GATC_a_1_+): 1523 total sites, 1489 covered (97.8%), 94.2% methylated
-  CCWGG (CCWGG_m_1_+): 832 total sites, 798 covered (95.9%), 89.5% methylated
+  GATC (GATC_a_1): 1523 total sites, 1489 covered (97.8%), 94.2% methylated
+  CCWGG (CCWGG_m_1): 832 total sites, 798 covered (95.9%), 89.5% methylated
 ```
 
 Then use the multi-motif model for simulation:
@@ -211,6 +221,24 @@ methylsim simulate \
 ```
 
 **Note:** If your FASTQ lacks MM/ML tags, you must tag it first (e.g., with a methylation caller or by running `methylsim simulate` in default high/low mode) before `fit-model` will learn anything.
+
+### Bundled model presets
+
+The crate ships with ready-to-use models in `models/`. The first preset is an E. coli Dam/Dcm model (`models/e_coli_G6mATC_C5mCWGG.toml`).
+Use it with `--model-preset` (motifs are pulled from the preset automatically, so `--motif` is optional):
+
+```bash
+methylsim simulate \
+  --reference references/ecoli.fa \
+  --model-preset ecoli \
+  --quantity 25x \
+  --output-fastq results/ecoli_preset.fastq
+```
+
+### ML tag sampling
+
+ML values come directly from methylation probabilities: a Beta draw yields the probability, then `ML = prob * 255`. Simple mode uses two default Beta templates scaled to `--motif-high-prob` and `--non-motif-high-prob`; learned models keep their own Beta parameters.
+You can override the simple-mode Betas with `--high-beta-alpha/--high-beta-beta` and `--low-beta-alpha/--low-beta-beta`; the probability of sampling the high vs low Beta is controlled by `--motif-high-prob` (motif sites) and `--non-motif-high-prob` (background).
 
 
 ## Motif definitions and methylation model
@@ -228,4 +256,3 @@ reference	motif	mod_position	mod_type
 bin_1	CCWGG	1	m
 bin_1	GCWGC	1	m
 ```
-

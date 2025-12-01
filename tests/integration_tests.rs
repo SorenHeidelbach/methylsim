@@ -61,6 +61,7 @@ fn test_fit_model_help() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("Required"));
     assert!(stdout.contains("Model Fitting Parameters"));
+    assert!(stdout.contains("n-reads"));
 }
 
 #[test]
@@ -86,13 +87,20 @@ fn test_simulate_basic() {
         .output()
         .expect("Failed to execute command");
 
-    assert!(output.status.success(), "Command failed: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "Command failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(output_path.exists(), "Output file was not created");
 
     // Verify output contains FASTQ records
     let content = fs::read_to_string(&output_path).expect("Failed to read output");
     let lines: Vec<&str> = content.lines().collect();
-    assert!(lines.len() >= 20, "Expected at least 20 lines (5 reads × 4 lines)");
+    assert!(
+        lines.len() >= 20,
+        "Expected at least 20 lines (5 reads × 4 lines)"
+    );
 
     // Check FASTQ format
     assert!(lines[0].starts_with('@'), "First line should be header");
@@ -125,14 +133,21 @@ fn test_simulate_with_tags_tsv() {
         .output()
         .expect("Failed to execute command");
 
-    assert!(output.status.success(), "Command failed: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "Command failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(output_tsv.exists(), "Tags TSV was not created");
 
     // Verify TSV format
     let content = fs::read_to_string(&output_tsv).expect("Failed to read TSV");
     let lines: Vec<&str> = content.lines().collect();
     assert!(lines.len() >= 4, "Expected header + at least 3 data lines");
-    assert!(lines[0].contains("read_id"), "Header should contain read_id");
+    assert!(
+        lines[0].contains("read_id"),
+        "Header should contain read_id"
+    );
     assert!(lines[0].contains("MM"), "Header should contain MM");
     assert!(lines[0].contains("ML"), "Header should contain ML");
 }
@@ -161,12 +176,19 @@ fn test_simulate_with_motif_file() {
         .output()
         .expect("Failed to execute command");
 
-    assert!(output.status.success(), "Command failed: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "Command failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(output_path.exists(), "Output file was not created");
 
     // Check that output mentions both motifs
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("2 motif(s)"), "Should load 2 motifs from file");
+    assert!(
+        stderr.contains("2 motif(s)"),
+        "Should load 2 motifs from file"
+    );
 }
 
 #[test]
@@ -183,7 +205,10 @@ fn test_simulate_missing_required_args() {
 
     assert!(!output.status.success(), "Should fail without motif");
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("motif") || stderr.contains("required"), "Error should mention motif requirement");
+    assert!(
+        stderr.contains("motif") || stderr.contains("required"),
+        "Error should mention motif requirement"
+    );
 }
 
 #[test]
@@ -212,7 +237,11 @@ fn test_fit_model_basic() {
         .output()
         .expect("Failed to execute simulate command");
 
-    assert!(sim_output.status.success(), "Simulate failed: {}", String::from_utf8_lossy(&sim_output.stderr));
+    assert!(
+        sim_output.status.success(),
+        "Simulate failed: {}",
+        String::from_utf8_lossy(&sim_output.stderr)
+    );
 
     // Fit model from tagged reads
     let fit_output = Command::new(get_binary_path())
@@ -226,15 +255,84 @@ fn test_fit_model_basic() {
         .output()
         .expect("Failed to execute fit-model command");
 
-    assert!(fit_output.status.success(), "Fit-model failed: {}", String::from_utf8_lossy(&fit_output.stderr));
+    assert!(
+        fit_output.status.success(),
+        "Fit-model failed: {}",
+        String::from_utf8_lossy(&fit_output.stderr)
+    );
     assert!(model_output.exists(), "Model JSON was not created");
 
     // Verify model JSON structure
     let model_content = fs::read_to_string(&model_output).expect("Failed to read model");
-    assert!(model_content.contains("version"), "Model should contain version");
-    assert!(model_content.contains("threshold"), "Model should contain threshold");
-    assert!(model_content.contains("motifs"), "Model should contain motifs");
-    assert!(model_content.contains("GATC"), "Model should contain GATC motif");
+    assert!(
+        model_content.contains("version"),
+        "Model should contain version"
+    );
+    assert!(
+        model_content.contains("threshold"),
+        "Model should contain threshold"
+    );
+    assert!(
+        model_content.contains("motifs"),
+        "Model should contain motifs"
+    );
+    assert!(
+        model_content.contains("GATC"),
+        "Model should contain GATC motif"
+    );
+}
+
+#[test]
+fn test_fit_model_with_n_reads_limit() {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let tagged_reads = temp_dir.path().join("tagged.fastq");
+    let model_output = temp_dir.path().join("model_limited.json");
+    let reference_path = get_test_data_path("test_reference.fasta");
+
+    // Generate a handful of tagged reads
+    let sim_output = Command::new(get_binary_path())
+        .arg("simulate")
+        .arg("--reference")
+        .arg(&reference_path)
+        .arg("--motif")
+        .arg("GATC_6mA_1")
+        .arg("--num-reads")
+        .arg("5")
+        .arg("--read-length")
+        .arg("100")
+        .arg("--output-fastq")
+        .arg(&tagged_reads)
+        .arg("--seed")
+        .arg("7")
+        .output()
+        .expect("Failed to execute simulate command");
+
+    assert!(
+        sim_output.status.success(),
+        "Simulate failed: {}",
+        String::from_utf8_lossy(&sim_output.stderr)
+    );
+
+    // Fit using only a subset of reads
+    let fit_output = Command::new(get_binary_path())
+        .arg("fit-model")
+        .arg("--reads")
+        .arg(&tagged_reads)
+        .arg("--motif")
+        .arg("GATC_6mA_1")
+        .arg("--model-out")
+        .arg(&model_output)
+        .arg("--n-reads")
+        .arg("2")
+        .output()
+        .expect("Failed to execute fit-model command");
+
+    assert!(
+        fit_output.status.success(),
+        "Fit-model failed: {}",
+        String::from_utf8_lossy(&fit_output.stderr)
+    );
+    assert!(model_output.exists(), "Model JSON was not created");
 }
 
 #[test]
@@ -317,12 +415,62 @@ fn test_simulate_with_learned_model() {
         .output()
         .expect("Failed to execute simulate with model");
 
-    assert!(sim2.status.success(), "Simulate with model failed: {}", String::from_utf8_lossy(&sim2.stderr));
-    assert!(output_with_model.exists(), "Output with model was not created");
+    assert!(
+        sim2.status.success(),
+        "Simulate with model failed: {}",
+        String::from_utf8_lossy(&sim2.stderr)
+    );
+    assert!(
+        output_with_model.exists(),
+        "Output with model was not created"
+    );
 
     // Verify output
     let content = fs::read_to_string(&output_with_model).expect("Failed to read output");
     assert!(content.contains("MM:Z:"), "Output should contain MM tags");
+}
+
+#[test]
+fn test_simulate_with_model_preset() {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let output_path = temp_dir.path().join("preset.fastq");
+    let reference_path = get_test_data_path("test_reference.fasta");
+
+    let output = Command::new(get_binary_path())
+        .arg("simulate")
+        .arg("--reference")
+        .arg(&reference_path)
+        .arg("--model-preset")
+        .arg("ecoli")
+        .arg("--num-reads")
+        .arg("3")
+        .arg("--read-length")
+        .arg("80")
+        .arg("--output-fastq")
+        .arg(&output_path)
+        .arg("--seed")
+        .arg("7")
+        .output()
+        .expect("Failed to execute simulate with preset");
+
+    assert!(
+        output.status.success(),
+        "Simulate with preset failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output_path.exists(), "Output with preset was not created");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Extracted 2 motif(s) from model"),
+        "Should pull motifs from preset"
+    );
+
+    let content = fs::read_to_string(&output_path).expect("Failed to read preset output");
+    assert!(
+        content.contains("MM:Z:"),
+        "Preset simulation should contain MM tags"
+    );
 }
 
 #[test]
@@ -406,18 +554,6 @@ fn test_methylation_probabilities() {
         .arg("5")
         .arg("--read-length")
         .arg("100")
-        .arg("--motif-high-prob")
-        .arg("0.8")
-        .arg("--non-motif-high-prob")
-        .arg("0.05")
-        .arg("--high-ml-mean")
-        .arg("220")
-        .arg("--high-ml-std")
-        .arg("15")
-        .arg("--low-ml-mean")
-        .arg("30")
-        .arg("--low-ml-std")
-        .arg("8")
         .arg("--output-fastq")
         .arg(&output_path)
         .arg("--seed")
@@ -425,7 +561,10 @@ fn test_methylation_probabilities() {
         .output()
         .expect("Failed to execute command");
 
-    assert!(output.status.success(), "Command with methylation params failed");
+    assert!(
+        output.status.success(),
+        "Command with methylation params failed"
+    );
     assert!(output_path.exists(), "Output not created");
 }
 
@@ -502,13 +641,19 @@ fn test_quantity_coverage() {
         .output()
         .expect("Failed to execute with coverage quantity");
 
-    assert!(output.status.success(), "Coverage quantity failed: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "Coverage quantity failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(output_path.exists());
 
     // Verify stderr mentions coverage calculation
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("Coverage-based quantity") && stderr.contains("coverage"),
-            "Should mention coverage calculation");
+    assert!(
+        stderr.contains("Coverage-based quantity") && stderr.contains("coverage"),
+        "Should mention coverage calculation"
+    );
 }
 
 #[test]
@@ -534,14 +679,21 @@ fn test_quantity_absolute() {
         .output()
         .expect("Failed to execute with absolute quantity");
 
-    assert!(output.status.success(), "Absolute quantity failed: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "Absolute quantity failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(output_path.exists());
 
     // Should generate 10,000 / 100 = 100 reads
     let content = fs::read_to_string(&output_path).expect("Failed to read output");
     let line_count = content.lines().count();
     // FASTQ has 4 lines per read
-    assert!(line_count >= 400 && line_count <= 400, "Should have ~100 reads (400 lines)");
+    assert!(
+        line_count >= 400 && line_count <= 400,
+        "Should have ~100 reads (400 lines)"
+    );
 }
 
 #[test]
@@ -569,7 +721,10 @@ fn test_multi_motif_model_fitting() {
         .output()
         .expect("Failed to simulate with multiple motifs");
 
-    assert!(sim_output.status.success(), "Simulate with multiple motifs failed");
+    assert!(
+        sim_output.status.success(),
+        "Simulate with multiple motifs failed"
+    );
 
     // Fit model from reads with multiple motifs
     let fit_output = Command::new(get_binary_path())
@@ -583,27 +738,43 @@ fn test_multi_motif_model_fitting() {
         .output()
         .expect("Failed to fit model with multiple motifs");
 
-    assert!(fit_output.status.success(), "Fit model with multiple motifs failed: {}",
-            String::from_utf8_lossy(&fit_output.stderr));
+    assert!(
+        fit_output.status.success(),
+        "Fit model with multiple motifs failed: {}",
+        String::from_utf8_lossy(&fit_output.stderr)
+    );
     assert!(model_output.exists(), "Model JSON was not created");
 
     // Verify model contains both motifs
     let model_content = fs::read_to_string(&model_output).expect("Failed to read model");
-    assert!(model_content.contains("GATC"), "Model should contain GATC motif");
-    assert!(model_content.contains("CCWGG"), "Model should contain CCWGG motif");
+    assert!(
+        model_content.contains("GATC"),
+        "Model should contain GATC motif"
+    );
+    assert!(
+        model_content.contains("CCWGG"),
+        "Model should contain CCWGG motif"
+    );
 
     // Parse JSON and verify structure
-    let model: serde_json::Value = serde_json::from_str(&model_content)
-        .expect("Failed to parse model JSON");
+    let model: serde_json::Value =
+        serde_json::from_str(&model_content).expect("Failed to parse model JSON");
 
-    let motifs = model["motifs"].as_array().expect("Model should have motifs array");
+    let motifs = model["motifs"]
+        .as_array()
+        .expect("Model should have motifs array");
     assert_eq!(motifs.len(), 2, "Model should contain exactly 2 motifs");
 
     // Verify stderr shows per-motif statistics
     let stderr = String::from_utf8_lossy(&fit_output.stderr);
-    assert!(stderr.contains("Fitting model for 2 motif(s)"), "Should mention 2 motifs");
-    assert!(stderr.contains("GATC") && stderr.contains("CCWGG"),
-            "Should show statistics for both motifs");
+    assert!(
+        stderr.contains("Fitting model for 2 motif(s)"),
+        "Should mention 2 motifs"
+    );
+    assert!(
+        stderr.contains("GATC") && stderr.contains("CCWGG"),
+        "Should show statistics for both motifs"
+    );
 }
 
 #[test]
@@ -668,8 +839,11 @@ fn test_simulate_with_multi_motif_model() {
         .output()
         .expect("Failed to simulate with multi-motif model");
 
-    assert!(sim2.status.success(), "Simulate with multi-motif model failed: {}",
-            String::from_utf8_lossy(&sim2.stderr));
+    assert!(
+        sim2.status.success(),
+        "Simulate with multi-motif model failed: {}",
+        String::from_utf8_lossy(&sim2.stderr)
+    );
     assert!(output_with_model.exists());
 
     // Verify output contains tags for both motif types

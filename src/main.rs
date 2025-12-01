@@ -1,23 +1,29 @@
 mod fastx;
 mod model;
 mod motif;
+mod presets;
 mod simulator;
 mod tagging;
 
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
-use log::{info, debug, warn};
+use log::{debug, info, warn};
 
-use fastx::{ReadRecord, read_fastx};
-use model::{LearnedModel, learn_model_from_reads};
-use motif::{MotifDefinition, load_motif_file};
-use simulator::{BuiltinSimulator, ErrorProfile, ReadLengthSpec, load_references, run_badreads};
-use tagging::MethylationTagger;
+use fastx::{read_fastx, ReadRecord};
+use model::{learn_model_from_reads, LearnedModel, MotifSampler};
+use motif::{load_motif_file, MotifDefinition};
+use presets::ModelPreset;
+use simulator::{
+    load_references, BadreadsSimulationConfig, BadreadsStrategy, BuiltinSimulationConfig,
+    BuiltinStrategy, ErrorProfile, ReadLengthSpec, SimulatorKindStrategy, SimulatorStrategy,
+};
+use tagging::{MethylationTagger, MethylationTaggerBuilder};
 
 #[derive(Copy, Clone, Debug, ValueEnum, PartialEq, Eq)]
 enum SimulatorKind {
@@ -83,7 +89,7 @@ struct SimulateArgs {
         long = "motif",
         num_args = 1..,
         value_delimiter = ',',
-        required_unless_present_any = ["motifs_file", "model_in"],
+        required_unless_present_any = ["motifs_file", "model_in", "model_preset"],
         help_heading = "Motif Definitions"
     )]
     motifs: Vec<String>,
@@ -101,7 +107,11 @@ struct SimulateArgs {
     ///
     /// Examples: '100M' = 100 million bases, '50x' = 50x coverage of reference
     /// If not specified, uses --num-reads instead
-    #[arg(long, help_heading = "Simulation Options", conflicts_with = "num_reads")]
+    #[arg(
+        long,
+        help_heading = "Simulation Options",
+        conflicts_with = "num_reads"
+    )]
     quantity: Option<String>,
 
     /// Number of reads to generate (deprecated: use --quantity instead)
@@ -133,19 +143,35 @@ struct SimulateArgs {
     badreads_exec: Option<PathBuf>,
 
     /// Extra arguments passed to badreads (e.g., '--quantity 50x --error_model nanopore2023')
-    #[arg(long, help_heading = "Badreads Simulator Options", allow_hyphen_values = true)]
+    #[arg(
+        long,
+        help_heading = "Badreads Simulator Options",
+        allow_hyphen_values = true
+    )]
     badreads_extra: Option<String>,
 
     /// Substitution error rate (0.0-1.0) for builtin simulator
-    #[arg(long, default_value_t = 0.03, help_heading = "Builtin Simulator Error Model")]
+    #[arg(
+        long,
+        default_value_t = 0.03,
+        help_heading = "Builtin Simulator Error Model"
+    )]
     substitution_rate: f64,
 
     /// Insertion error rate (0.0-1.0) for builtin simulator
-    #[arg(long, default_value_t = 0.01, help_heading = "Builtin Simulator Error Model")]
+    #[arg(
+        long,
+        default_value_t = 0.01,
+        help_heading = "Builtin Simulator Error Model"
+    )]
     insertion_rate: f64,
 
     /// Deletion error rate (0.0-1.0) for builtin simulator
-    #[arg(long, default_value_t = 0.01, help_heading = "Builtin Simulator Error Model")]
+    #[arg(
+        long,
+        default_value_t = 0.01,
+        help_heading = "Builtin Simulator Error Model"
+    )]
     deletion_rate: f64,
 
     // ========== Methylation Model Parameters ==========
@@ -153,33 +179,70 @@ struct SimulateArgs {
     #[arg(long, help_heading = "Methylation Model")]
     model_in: Option<PathBuf>,
 
+    /// Use a bundled preset model (e.g., 'ecoli' for Dam/Dcm methylation)
+    #[arg(
+        long,
+        value_enum,
+        conflicts_with = "model_in",
+        help_heading = "Methylation Model"
+    )]
+    model_preset: Option<ModelPreset>,
+
     /// Probability a motif site is methylated (0.0-1.0) [used when --model-in not provided]
-    #[arg(long, default_value_t = 0.95, help_heading = "Methylation Model (simple mode)")]
+    #[arg(
+        long,
+        default_value_t = 0.95,
+        help_heading = "Methylation Model (simple mode)"
+    )]
     motif_high_prob: f64,
 
     /// Background probability for non-motif sites (0.0-1.0)
-    #[arg(long, default_value_t = 0.01, help_heading = "Methylation Model (simple mode)")]
+    #[arg(
+        long,
+        default_value_t = 0.01,
+        help_heading = "Methylation Model (simple mode)"
+    )]
     non_motif_high_prob: f64,
 
-    /// Mean ML value (0-255) for methylated bases
-    #[arg(long, default_value_t = 230.0, help_heading = "Methylation Model (simple mode)")]
-    high_ml_mean: f64,
+    /// Alpha parameter for the high (methylated) Beta distribution when not using a learned model
+    #[arg(
+        long,
+        default_value_t = 2.8685813093772063,
+        help_heading = "Methylation Model (simple mode)"
+    )]
+    high_beta_alpha: f64,
 
-    /// Std deviation of ML values for methylated bases
-    #[arg(long, default_value_t = 10.0, help_heading = "Methylation Model (simple mode)")]
-    high_ml_std: f64,
+    /// Beta parameter for the high (methylated) Beta distribution when not using a learned model
+    #[arg(
+        long,
+        default_value_t = 0.055071333309938346,
+        help_heading = "Methylation Model (simple mode)"
+    )]
+    high_beta_beta: f64,
 
-    /// Mean ML value (0-255) for unmethylated bases
-    #[arg(long, default_value_t = 20.0, help_heading = "Methylation Model (simple mode)")]
-    low_ml_mean: f64,
+    /// Alpha parameter for the low (unmethylated) Beta distribution when not using a learned model
+    #[arg(
+        long,
+        default_value_t = 2.460887754108385,
+        help_heading = "Methylation Model (simple mode)"
+    )]
+    low_beta_alpha: f64,
 
-    /// Std deviation of ML values for unmethylated bases
-    #[arg(long, default_value_t = 5.0, help_heading = "Methylation Model (simple mode)")]
-    low_ml_std: f64,
+    /// Beta parameter for the low (unmethylated) Beta distribution when not using a learned model
+    #[arg(
+        long,
+        default_value_t = 6.6833122937987115,
+        help_heading = "Methylation Model (simple mode)"
+    )]
+    low_beta_beta: f64,
 
     // ========== Output Options ==========
     /// Output FASTQ file path
-    #[arg(long, default_value = "methylsim.fastq", help_heading = "Output Options")]
+    #[arg(
+        long,
+        default_value = "methylsim.fastq",
+        help_heading = "Output Options"
+    )]
     output_fastq: PathBuf,
 
     /// Optional TSV output with read_id, MM, ML columns
@@ -223,6 +286,10 @@ struct FitModelArgs {
     /// to fit separate Beta distributions for methylated and unmethylated populations
     #[arg(long, default_value_t = 0.5, help_heading = "Model Fitting Parameters")]
     model_threshold: f64,
+
+    /// Limit the number of reads used for fitting (processes the first N reads)
+    #[arg(long, help_heading = "Model Fitting Parameters")]
+    n_reads: Option<usize>,
 }
 
 #[derive(Default)]
@@ -232,6 +299,27 @@ struct WriteStats {
     reads_with_motif_hits: usize,
     total_motif_hits: usize,
     total_motif_high: usize,
+}
+
+struct LoadedModel {
+    model: LearnedModel,
+}
+
+#[derive(Debug)]
+enum ModelOrigin {
+    File(PathBuf),
+    Preset(ModelPreset),
+}
+
+impl ModelOrigin {
+    fn describe(&self) -> String {
+        match self {
+            ModelOrigin::File(path) => path.display().to_string(),
+            ModelOrigin::Preset(preset) => {
+                format!("preset '{}' ({})", preset.cli_token(), preset.label())
+            }
+        }
+    }
 }
 
 fn main() -> Result<()> {
@@ -252,7 +340,7 @@ fn main() -> Result<()> {
 fn collect_motif_specs(
     motifs: &[String],
     motifs_file: Option<&PathBuf>,
-    model_path: Option<&PathBuf>,
+    model: Option<&LearnedModel>,
 ) -> Result<Vec<String>> {
     debug!("Collecting motif specifications from command line, files, and model");
     let mut specs = motifs.to_vec();
@@ -266,9 +354,8 @@ fn collect_motif_specs(
 
     // If no motifs provided but model is available, extract from model
     if specs.is_empty() {
-        if let Some(model_path) = model_path {
-            info!("No motifs specified, extracting from model: {}", model_path.display());
-            let model = LearnedModel::load(model_path)?;
+        if let Some(model) = model {
+            info!("No motifs specified, extracting from model");
             specs = model.extract_motif_specs();
             info!("Extracted {} motif(s) from model", specs.len());
         }
@@ -283,7 +370,7 @@ fn collect_motif_specs(
         filtered.push(spec);
     }
     if filtered.is_empty() {
-        bail!("At least one motif specification must be supplied (via --motif, --motifs-file, or --model-in)");
+        bail!("At least one motif specification must be supplied (via --motif, --motifs-file, or --model-in/--model-preset)");
     }
     info!("Using {} motif(s): {}", filtered.len(), filtered.join(", "));
     Ok(filtered)
@@ -297,8 +384,12 @@ fn parse_quantity(quantity: &str, reference_size: usize, mean_read_length: usize
     // Check for coverage specification (ends with 'X')
     if quantity.ends_with('X') {
         let coverage_str = &quantity[..quantity.len() - 1];
-        let coverage: f64 = coverage_str.parse()
-            .with_context(|| format!("Invalid coverage value in '{}'. Expected format like '25x'", quantity))?;
+        let coverage: f64 = coverage_str.parse().with_context(|| {
+            format!(
+                "Invalid coverage value in '{}'. Expected format like '25x'",
+                quantity
+            )
+        })?;
 
         if coverage <= 0.0 {
             bail!("Coverage must be positive, got: {}", coverage);
@@ -307,7 +398,8 @@ fn parse_quantity(quantity: &str, reference_size: usize, mean_read_length: usize
         // Calculate number of reads needed for desired coverage
         // coverage = (num_reads * mean_read_length) / reference_size
         // num_reads = (coverage * reference_size) / mean_read_length
-        let num_reads = ((coverage * reference_size as f64) / mean_read_length as f64).ceil() as usize;
+        let num_reads =
+            ((coverage * reference_size as f64) / mean_read_length as f64).ceil() as usize;
 
         info!(
             "Coverage-based quantity: {}x coverage → {} reads (ref_size: {}, read_length: {})",
@@ -327,8 +419,12 @@ fn parse_quantity(quantity: &str, reference_size: usize, mean_read_length: usize
             (quantity.as_str(), 1)
         };
 
-        let total_bases: f64 = num_str.parse()
-            .with_context(|| format!("Invalid quantity '{}'. Expected format like '250M', '25x', or a plain number", quantity))?;
+        let total_bases: f64 = num_str.parse().with_context(|| {
+            format!(
+                "Invalid quantity '{}'. Expected format like '250M', '25x', or a plain number",
+                quantity
+            )
+        })?;
 
         if total_bases <= 0.0 {
             bail!("Quantity must be positive, got: {}", total_bases);
@@ -361,66 +457,163 @@ fn looks_like_motif_header(spec: &str) -> bool {
     contains == 0b111
 }
 
+fn load_model_source(
+    model_path: Option<&PathBuf>,
+    preset: Option<ModelPreset>,
+) -> Result<Option<LoadedModel>> {
+    if let Some(path) = model_path {
+        let origin = ModelOrigin::File(path.clone());
+        info!("Loading model from {}", origin.describe());
+        let model = LearnedModel::load(path)?;
+        return Ok(Some(LoadedModel { model }));
+    }
+
+    if let Some(preset) = preset {
+        let origin = ModelOrigin::Preset(preset);
+        info!("Loading built-in model {}", origin.describe());
+        let model = preset
+            .load_model()
+            .with_context(|| format!("Failed to load preset '{}'", preset.cli_token()))?;
+        return Ok(Some(LoadedModel { model }));
+    }
+
+    Ok(None)
+}
+
+fn build_tagger_from_args(
+    motifs: Vec<MotifDefinition>,
+    args: &SimulateArgs,
+    sampler_map: Option<HashMap<String, MotifSampler>>,
+    model: Option<&LearnedModel>,
+) -> Result<MethylationTagger> {
+    if let Some(model) = model {
+        // Ensure every motif requested exists in the model when using a learned model
+        let model_keys: std::collections::HashSet<_> =
+            model.motifs.iter().map(|m| m.key.clone()).collect();
+        for motif in &motifs {
+            let key = motif.model_key();
+            if !model_keys.contains(&key) {
+                bail!("Motif '{}' is not present in the supplied model file", key);
+            }
+        }
+    }
+    MethylationTaggerBuilder::new(motifs)
+        .with_probs(args.motif_high_prob, args.non_motif_high_prob)
+        .with_betas(
+            args.high_beta_alpha,
+            args.high_beta_beta,
+            args.low_beta_alpha,
+            args.low_beta_beta,
+        )
+        .with_seed(args.seed)
+        .with_sampler_map(sampler_map)
+        .build()
+}
+
+fn build_simulator_strategy(args: &SimulateArgs) -> Result<Option<SimulatorKindStrategy>> {
+    let Some(reference_path) = args.reference.as_ref() else {
+        return Ok(None);
+    };
+
+    let references = load_references(reference_path)?;
+    let reference_size: usize = references.iter().map(|r| r.len()).sum();
+    info!(
+        "Loaded reference: {} sequences, {} total bases",
+        references.len(),
+        reference_size
+    );
+
+    let length_spec = if let Some(mean) = args.read_length_mean {
+        ReadLengthSpec::Mean(mean)
+    } else if let Some(n50) = args.read_length_n50 {
+        ReadLengthSpec::N50(n50)
+    } else {
+        ReadLengthSpec::Mode(args.read_length)
+    };
+
+    let num_reads = if let Some(quantity) = &args.quantity {
+        let mean_length = args
+            .read_length_mean
+            .unwrap_or_else(|| args.read_length_n50.unwrap_or(args.read_length));
+        parse_quantity(quantity, reference_size, mean_length)?
+    } else {
+        args.num_reads
+    };
+
+    match args.simulator {
+        SimulatorKind::Builtin => {
+            let profile = ErrorProfile {
+                substitution_rate: args.substitution_rate,
+                insertion_rate: args.insertion_rate,
+                deletion_rate: args.deletion_rate,
+            };
+            info!("Starting builtin simulator");
+            debug!(
+                "Error profile: sub={:.3}, ins={:.3}, del={:.3}",
+                profile.substitution_rate, profile.insertion_rate, profile.deletion_rate
+            );
+            let config = BuiltinSimulationConfig {
+                references,
+                profile,
+                length_spec,
+                num_reads,
+                name_prefix: args.name_prefix.clone(),
+                seed: args.seed,
+            };
+            let strategy = BuiltinStrategy::new(config)?;
+            Ok(Some(SimulatorKindStrategy::Builtin(strategy)))
+        }
+        SimulatorKind::Badreads => {
+            info!("Starting badread simulation");
+            let config = BadreadsSimulationConfig {
+                reference: reference_path.clone(),
+                num_reads,
+                read_length: args.read_length,
+                executable: args.badreads_exec.clone(),
+                extra_args: args.badreads_extra.clone(),
+                seed: args.seed,
+            };
+            Ok(Some(SimulatorKindStrategy::Badreads(
+                BadreadsStrategy::new(config),
+            )))
+        }
+    }
+}
+
 fn run_simulate(args: SimulateArgs) -> Result<()> {
     validate_simulate_inputs(&args)?;
+    let loaded_model = load_model_source(args.model_in.as_ref(), args.model_preset)?;
+    let model_ref = loaded_model.as_ref().map(|m| &m.model);
 
     // Handle direct BAM tagging mode
     if args.reads.is_none() && args.reference.is_none() && args.bam_input.is_some() {
         let bam_in = args.bam_input.as_ref().unwrap();
-        let bam_out = args.bam_output.as_ref()
+        let bam_out = args
+            .bam_output
+            .as_ref()
             .expect("--bam-output must be supplied when using --bam-input");
 
-        let motif_specs = collect_motif_specs(&args.motifs, args.motifs_file.as_ref(), args.model_in.as_ref())?;
+        let motif_specs = collect_motif_specs(&args.motifs, args.motifs_file.as_ref(), model_ref)?;
         let motifs = motif_specs
             .iter()
             .map(|spec| MotifDefinition::parse(spec))
             .collect::<Result<Vec<_>>>()?;
-        let sampler_map = if let Some(path) = args.model_in.as_ref() {
-            let model = LearnedModel::load(path)?;
-            Some(model.build_samplers()?)
-        } else {
-            None
-        };
+        let sampler_map = model_ref.map(|model| model.build_samplers()).transpose()?;
 
-        let mut tagger = MethylationTagger::new(
-            motifs,
-            args.motif_high_prob,
-            args.non_motif_high_prob,
-            args.high_ml_mean,
-            args.high_ml_std,
-            args.low_ml_mean,
-            args.low_ml_std,
-            args.seed,
-            sampler_map,
-        )?;
+        let mut tagger = build_tagger_from_args(motifs, &args, sampler_map, model_ref)?;
 
         tag_bam_directly(bam_in, bam_out, &mut tagger)?;
         return Ok(());
     }
 
-    let motif_specs = collect_motif_specs(&args.motifs, args.motifs_file.as_ref(), args.model_in.as_ref())?;
+    let motif_specs = collect_motif_specs(&args.motifs, args.motifs_file.as_ref(), model_ref)?;
     let motifs = motif_specs
         .iter()
         .map(|spec| MotifDefinition::parse(spec))
         .collect::<Result<Vec<_>>>()?;
-    let sampler_map = if let Some(path) = args.model_in.as_ref() {
-        let model = LearnedModel::load(path)?;
-        Some(model.build_samplers()?)
-    } else {
-        None
-    };
+    let sampler_map = model_ref.map(|model| model.build_samplers()).transpose()?;
 
-    let mut tagger = MethylationTagger::new(
-        motifs,
-        args.motif_high_prob,
-        args.non_motif_high_prob,
-        args.high_ml_mean,
-        args.high_ml_std,
-        args.low_ml_mean,
-        args.low_ml_std,
-        args.seed,
-        sampler_map,
-    )?;
+    let mut tagger = build_tagger_from_args(motifs, &args, sampler_map, model_ref)?;
 
     let mut fastq_writer = BufWriter::new(
         File::create(&args.output_fastq)
@@ -453,21 +646,17 @@ fn run_simulate(args: SimulateArgs) -> Result<()> {
             )?;
         }
     } else {
-        match args.simulator {
-            SimulatorKind::Builtin => simulate_builtin(
-                &args,
+        let mut strategy = build_simulator_strategy(&args)?
+            .ok_or_else(|| anyhow!("Simulation requires a reference sequence"))?;
+        let reads = strategy.simulate()?;
+        for read in reads {
+            write_read(
+                &read,
                 &mut tagger,
                 &mut fastq_writer,
                 &mut tags_writer,
                 &mut stats,
-            )?,
-            SimulatorKind::Badreads => simulate_badreads(
-                &args,
-                &mut tagger,
-                &mut fastq_writer,
-                &mut tags_writer,
-                &mut stats,
-            )?,
+            )?;
         }
     }
 
@@ -504,18 +693,33 @@ fn run_fit_model(args: FitModelArgs) -> Result<()> {
         .map(|spec| MotifDefinition::parse(spec))
         .collect::<Result<Vec<_>>>()?;
 
-    eprintln!("Learning methylation patterns from reads in: {}", args.reads.display());
+    eprintln!(
+        "Learning methylation patterns from reads in: {}",
+        args.reads.display()
+    );
     debug!("Model threshold: {}", args.model_threshold);
-    let model = learn_model_from_reads(&args.reads, &motifs, args.model_threshold)?;
+    debug!(
+        "Read sampling limit: {}",
+        args.n_reads
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "all".to_string())
+    );
+    let model = learn_model_from_reads(&args.reads, &motifs, args.model_threshold, args.n_reads)?;
 
     info!("Saving model to: {}", args.model_out.display());
     model.save(&args.model_out)?;
-    info!("Successfully saved model with {} motif(s)", model.motifs.len());
+    info!(
+        "Successfully saved model with {} motif(s)",
+        model.motifs.len()
+    );
 
     Ok(())
 }
 
 fn validate_simulate_inputs(args: &SimulateArgs) -> Result<()> {
+    if args.model_in.is_some() && args.model_preset.is_some() {
+        bail!("Only one of --model-in or --model-preset can be supplied");
+    }
     if args.reads.is_none() && args.reference.is_none() && args.bam_input.is_none() {
         bail!("Simulate requires either --reads, --reference, or --bam-input");
     }
@@ -558,17 +762,15 @@ fn validate_simulate_inputs(args: &SimulateArgs) -> Result<()> {
         if !(0.0..=1.0).contains(&args.non_motif_high_prob) {
             bail!("--non-motif-high-prob must be between 0 and 1");
         }
-        if !(0.0..=255.0).contains(&args.high_ml_mean) {
-            bail!("--high-ml-mean must lie between 0 and 255");
-        }
-        if args.high_ml_std.is_sign_negative() {
-            bail!("--high-ml-std must be non-negative");
-        }
-        if !(0.0..=255.0).contains(&args.low_ml_mean) {
-            bail!("--low-ml-mean must lie between 0 and 255");
-        }
-        if args.low_ml_std.is_sign_negative() {
-            bail!("--low-ml-std must be non-negative");
+        for (name, val) in [
+            ("--high-beta-alpha", args.high_beta_alpha),
+            ("--high-beta-beta", args.high_beta_beta),
+            ("--low-beta-alpha", args.low_beta_alpha),
+            ("--low-beta-beta", args.low_beta_beta),
+        ] {
+            if !val.is_finite() || val <= 0.0 {
+                bail!("{name} must be positive and finite");
+            }
         }
     }
     Ok(())
@@ -581,99 +783,10 @@ fn validate_fit_inputs(args: &FitModelArgs) -> Result<()> {
     if args.motifs.is_empty() && args.motifs_file.is_none() {
         bail!("At least one motif must be supplied via --motif or --motifs-file");
     }
-    Ok(())
-}
-
-fn simulate_builtin(
-    args: &SimulateArgs,
-    tagger: &mut MethylationTagger,
-    fastq_writer: &mut BufWriter<File>,
-    tags_writer: &mut Option<BufWriter<File>>,
-    stats: &mut WriteStats,
-) -> Result<()> {
-    let reference_path = args
-        .reference
-        .as_ref()
-        .ok_or_else(|| anyhow!("Builtin simulator requires --reference"))?;
-
-    info!("Starting builtin simulator");
-    debug!("Loading reference from: {}", reference_path.display());
-    let references = load_references(reference_path)?;
-    let reference_size: usize = references.iter().map(|r| r.len()).sum();
-    info!("Loaded reference: {} sequences, {} total bases", references.len(), reference_size);
-
-    let profile = ErrorProfile {
-        substitution_rate: args.substitution_rate,
-        insertion_rate: args.insertion_rate,
-        deletion_rate: args.deletion_rate,
-    };
-    debug!("Error profile: sub={:.3}, ins={:.3}, del={:.3}",
-           profile.substitution_rate, profile.insertion_rate, profile.deletion_rate);
-
-    let length_spec = if let Some(mean) = args.read_length_mean {
-        ReadLengthSpec::Mean(mean)
-    } else if let Some(n50) = args.read_length_n50 {
-        ReadLengthSpec::N50(n50)
-    } else {
-        ReadLengthSpec::Mode(args.read_length)
-    };
-
-    // Calculate number of reads based on quantity or use num_reads
-    let num_reads = if let Some(quantity) = &args.quantity {
-        // Use read_length as the mean for quantity calculation
-        let mean_length = args.read_length_mean.unwrap_or_else(|| {
-            args.read_length_n50.unwrap_or(args.read_length)
-        });
-        parse_quantity(quantity, reference_size, mean_length)?
-    } else {
-        info!("Generating {} reads", args.num_reads);
-        args.num_reads
-    };
-
-    info!("Simulating {} reads with seed {}", num_reads, args.seed);
-    let mut simulator = BuiltinSimulator::new(references, profile, length_spec, args.seed)?;
-
-    let progress_interval = (num_reads / 10).max(1).min(1000);
-    for idx in 0..num_reads {
-        let name = format!("{}_{}", args.name_prefix, format!("{:06}", idx + 1));
-        let read = simulator.generate_read(name);
-        write_read(&read, tagger, fastq_writer, tags_writer, stats)?;
-
-        if (idx + 1) % progress_interval == 0 || idx + 1 == num_reads {
-            let pct = (idx + 1) as f64 / num_reads as f64 * 100.0;
-            info!("Progress: {}/{} reads ({:.1}%)", idx + 1, num_reads, pct);
+    if let Some(n) = args.n_reads {
+        if n == 0 {
+            bail!("--n-reads must be greater than zero");
         }
-    }
-
-    info!("Simulation complete");
-    Ok(())
-}
-
-fn simulate_badreads(
-    args: &SimulateArgs,
-    tagger: &mut MethylationTagger,
-    fastq_writer: &mut BufWriter<File>,
-    tags_writer: &mut Option<BufWriter<File>>,
-    stats: &mut WriteStats,
-) -> Result<()> {
-    let reference_path = args
-        .reference
-        .as_ref()
-        .ok_or_else(|| anyhow!("badread simulation requires --reference"))?;
-    eprintln!(
-        "Invoking badread simulator with reference '{}'...",
-        reference_path.display()
-    );
-    let reads = run_badreads(
-        reference_path,
-        args.num_reads,
-        Some(args.read_length),
-        args.badreads_exec.as_ref(),
-        args.badreads_extra.as_deref(),
-        Some(args.seed),
-    )?;
-    for read in reads {
-        write_read(&read, tagger, fastq_writer, tags_writer, stats)?;
     }
     Ok(())
 }
@@ -781,8 +894,12 @@ fn tag_bam_directly(bam_in: &Path, bam_out: &Path, tagger: &mut MethylationTagge
 
         // Log progress periodically
         if total > 0 && total % 10000 == 0 {
-            info!("Processed {} reads, tagged {} ({:.1}%)",
-                  total, tagged, (tagged as f64 / total as f64) * 100.0);
+            info!(
+                "Processed {} reads, tagged {} ({:.1}%)",
+                total,
+                tagged,
+                (tagged as f64 / total as f64) * 100.0
+            );
         }
 
         // Trim newlines
@@ -845,8 +962,13 @@ fn tag_bam_directly(bam_in: &Path, bam_out: &Path, tagger: &mut MethylationTagge
     debug!("Processed {} header lines", headers);
     info!(
         "BAM tagging complete: tagged {} of {} reads ({:.1}%) → {}",
-        tagged, total,
-        if total > 0 { (tagged as f64 / total as f64) * 100.0 } else { 0.0 },
+        tagged,
+        total,
+        if total > 0 {
+            (tagged as f64 / total as f64) * 100.0
+        } else {
+            0.0
+        },
         bam_out.display()
     );
 
