@@ -6,7 +6,6 @@ use anyhow::{Context, Result, anyhow, bail};
 use log::{info, debug};
 use rand::Rng;
 use rand::rngs::StdRng;
-use rand::Rng;
 use rand_distr::{Beta, Distribution};
 use serde::{Deserialize, Serialize};
 

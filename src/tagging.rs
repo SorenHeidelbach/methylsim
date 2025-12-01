@@ -91,17 +91,25 @@ struct DefaultBetas {
 impl Default for DefaultBetas {
     fn default() -> Self {
         let high = (2.8685813093772063, 0.055071333309938346);
-        let fallback_low = (2.460887754108385, 6.6833122937987115); // 6mA defaults
+        let fallback_low = (0.3451168730448373, 5.040038112000441); // 6mA defaults
 
         let mut mod_low = HashMap::new();
         // Adenine methylation (6mA)
-        mod_low.insert("a".to_string(), (2.460887754108385, 6.6833122937987115));
-        mod_low.insert("6ma".to_string(), (2.460887754108385, 6.6833122937987115));
+        let sixma = (0.3451168730448373, 5.040038112000441);
+        mod_low.insert("6mA".to_string(), sixma);
+        mod_low.insert("a".to_string(), sixma);
+        mod_low.insert("6ma".to_string(), sixma);
         // Cytosine methylation (5mC / 4mC)
-        mod_low.insert("m".to_string(), (1.9849538027481268, 5.590529733150861));
-        mod_low.insert("5mc".to_string(), (1.9849538027481268, 5.590529733150861));
-        mod_low.insert("4mc".to_string(), (1.9849538027481268, 5.590529733150861));
-        mod_low.insert("c".to_string(), (1.9849538027481268, 5.590529733150861));
+        let fivemc = (1.3799717363106534, 8.927216036532014);
+        mod_low.insert("5mC".to_string(), fivemc);
+        mod_low.insert("5mc".to_string(), fivemc);
+        mod_low.insert("m".to_string(), fivemc);
+
+        let forumc = (1.3799717363106534, 8.927216036532014);
+        mod_low.insert("4mC".to_string(), forumc);
+        mod_low.insert("4mc".to_string(), forumc);
+        mod_low.insert("c".to_string(), forumc);
+        mod_low.insert("218".to_string(), forumc);
 
         Self {
             high,
