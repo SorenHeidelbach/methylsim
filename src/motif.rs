@@ -71,6 +71,12 @@ mod tests {
     }
 
     #[test]
+    fn canonicalizes_4mc_to_numeric_code() {
+        let motif = MotifDefinition::parse("CCGG:C:1:4mC:+").expect("parse motif");
+        assert_eq!(motif.mod_code, "21839");
+    }
+
+    #[test]
     fn load_motif_file_handles_complements() {
         let mut file = NamedTempFile::new().unwrap();
         writeln!(
@@ -284,8 +290,9 @@ fn canonical_mod_code(code: &str) -> String {
     match code.to_ascii_lowercase().as_str() {
         "5mc" => "m".to_string(),
         "6ma" => "a".to_string(),
+        "4mc" => "21839".to_string(),
         other => {
-            if other == "m" || other == "a" || other == "21839" || other == "4mc" {
+            if other == "m" || other == "a" || other == "21839" {
                 other.to_string()
             } else {
                 code.to_string()

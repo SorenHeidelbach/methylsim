@@ -96,20 +96,20 @@ impl Default for DefaultBetas {
         let mut mod_low = HashMap::new();
         // Adenine methylation (6mA)
         let sixma = (0.3451168730448373, 5.040038112000441);
-        mod_low.insert("6mA".to_string(), sixma);
+        mod_low.insert("6mA".to_ascii_lowercase(), sixma);
         mod_low.insert("a".to_string(), sixma);
         mod_low.insert("6ma".to_string(), sixma);
         // Cytosine methylation (5mC / 4mC)
         let fivemc = (1.3799717363106534, 8.927216036532014);
-        mod_low.insert("5mC".to_string(), fivemc);
+        mod_low.insert("5mC".to_ascii_lowercase(), fivemc);
         mod_low.insert("5mc".to_string(), fivemc);
         mod_low.insert("m".to_string(), fivemc);
 
-        let forumc = (1.3799717363106534, 8.927216036532014);
-        mod_low.insert("4mC".to_string(), forumc);
+        let forumc = (0.8124532876545941, 9.107388497092732);
+        mod_low.insert("4mC".to_ascii_lowercase(), forumc);
         mod_low.insert("4mc".to_string(), forumc);
         mod_low.insert("c".to_string(), forumc);
-        mod_low.insert("218".to_string(), forumc);
+        mod_low.insert("21839".to_string(), forumc);
 
         Self {
             high,
@@ -361,14 +361,18 @@ impl MethylationTagger {
                 &mod_code,
                 &mut self.rng,
             );
-            let is_high = self.sample_high(probability);
-            let ml_value = (probability * 255.0).round().clamp(0.0, 255.0) as u8;
+            let is_modified = self.sample_high(probability);
             if is_motif {
                 *motif_hit_count += 1;
-                if is_high {
+                if is_modified {
                     *motif_high_count += 1;
                 }
             }
+            if !is_modified {
+                continue;
+            }
+
+            let ml_value = (probability * 255.0).round().clamp(0.0, 255.0) as u8;
             events.push(ModificationEvent {
                 position: idx,
                 ml_value,
@@ -507,5 +511,70 @@ impl ProbabilitySampler for MixtureProbabilitySampler {
                 .sample(rng)
         };
         prob.clamp(0.0, 1.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::motif::MotifDefinition;
+
+    #[test]
+    fn annotate_skips_unmodified_sites() {
+        struct ZeroSampler;
+        impl ProbabilitySampler for ZeroSampler {
+            fn sample_probability(
+                &mut self,
+                _site: SiteKind,
+                _model_sampler: Option<&MotifSampler>,
+                _mod_code: &str,
+                _rng: &mut StdRng,
+            ) -> f64 {
+                0.0
+            }
+        }
+
+        let motif = MotifDefinition::parse("A:A:0:m:+").expect("parse motif");
+        let mut tagger = MethylationTaggerBuilder::new(vec![motif])
+            .with_seed(1)
+            .build()
+            .expect("build tagger");
+        tagger.probability_sampler = Box::new(ZeroSampler);
+
+        let result = tagger.annotate("AAAA");
+        assert!(
+            result.mm_tag.is_none() && result.ml_tag.is_none(),
+            "Tags should be absent when no sites are modified"
+        );
+    }
+
+    #[test]
+    fn annotate_uses_numeric_code_for_4mc() {
+        struct OneSampler;
+        impl ProbabilitySampler for OneSampler {
+            fn sample_probability(
+                &mut self,
+                _site: SiteKind,
+                _model_sampler: Option<&MotifSampler>,
+                _mod_code: &str,
+                _rng: &mut StdRng,
+            ) -> f64 {
+                1.0
+            }
+        }
+
+        let motif = MotifDefinition::parse("CCGG:C:1:4mC:+").expect("parse motif");
+        let mut tagger = MethylationTaggerBuilder::new(vec![motif])
+            .with_seed(1)
+            .build()
+            .expect("build tagger");
+        tagger.probability_sampler = Box::new(OneSampler);
+
+        let result = tagger.annotate("CCGGCCGG");
+        let mm = result.mm_tag.expect("mm tag");
+        assert!(
+            mm.contains("21839"),
+            "Expected numeric 21839 code, got {mm}"
+        );
     }
 }
