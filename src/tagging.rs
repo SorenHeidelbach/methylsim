@@ -17,6 +17,15 @@ pub struct TagResult {
 
 impl TagResult {}
 
+#[derive(Default)]
+pub struct WriteStats {
+    pub total_reads: usize,
+    pub tagged_reads: usize,
+    pub reads_with_motif_hits: usize,
+    pub total_motif_hits: usize,
+    pub total_motif_high: usize,
+}
+
 struct ModificationEvent {
     position: usize,
     ml_value: u8,

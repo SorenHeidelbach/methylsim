@@ -26,7 +26,7 @@ impl ModelPreset {
     pub fn load_model(&self) -> Result<LearnedModel> {
         match self {
             ModelPreset::EColiG6mATCC5mCWGG => {
-                let raw = include_str!("../models/e_coli_G6mATC_C5mCWGG.toml");
+                let raw = include_str!("../models/e_coli_G6mATC_C5mCWGG.yaml");
                 serde_json::from_str(raw).context("Failed to parse bundled E. coli model")
             }
         }
