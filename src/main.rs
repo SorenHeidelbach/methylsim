@@ -5,15 +5,25 @@ mod presets;
 mod simulator;
 mod tagging;
 
-use std::collections::HashMap;
-use std::fs::File;
-use std::io::{BufRead, BufReader, BufWriter, Write};
-use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use log::{debug, info, warn};
+use noodles::bam::io::{
+    reader::Builder as BamReaderBuilder, writer::Builder as BamWriterBuilder, Writer as BamWriter,
+};
+use noodles::bgzf;
+use noodles::sam::{
+    self,
+    alignment::io::Write as AlignmentWrite,
+    alignment::{self, record::data::field::Tag, record::QualityScores, record_buf},
+    io::reader::Builder as SamReaderBuilder,
+    io::Writer as SamWriter,
+};
+use std::collections::HashMap;
+use std::fs::File;
+use std::io::{BufWriter, Write};
+use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
 use fastx::{read_fastx, ReadRecord};
 use model::{learn_model_from_reads, LearnedModel, MotifSampler};
@@ -23,12 +33,26 @@ use simulator::{
     load_references, BadreadsSimulationConfig, BadreadsStrategy, BuiltinSimulationConfig,
     BuiltinStrategy, ErrorProfile, ReadLengthSpec, SimulatorKindStrategy, SimulatorStrategy,
 };
-use tagging::{MethylationTagger, MethylationTaggerBuilder};
+use tagging::{MethylationTagger, MethylationTaggerBuilder, TagResult};
 
 #[derive(Copy, Clone, Debug, ValueEnum, PartialEq, Eq)]
 enum SimulatorKind {
     Builtin,
     Badreads,
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum, PartialEq, Eq)]
+enum OutputFormat {
+    Fastq,
+    Sam,
+    Bam,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum InputFormat {
+    Fastx,
+    Sam,
+    Bam,
 }
 
 #[derive(Parser, Debug)]
@@ -45,12 +69,11 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// Simulate reads or tag existing FASTQ/FASTA/BAM with methylation marks
+    /// Simulate reads or tag existing reads with methylation marks
     ///
     /// This command can:
     /// - Simulate new reads from a reference FASTA (--reference)
-    /// - Tag existing FASTQ/FASTA files with methylation (--reads)
-    /// - Tag BAM files using precomputed tags (--bam-input + --tags-tsv-input)
+    /// - Tag existing FASTQ/SAM/BAM files with methylation (--reads)
     Simulate(SimulateArgs),
 
     /// Learn a methylation model from reads with MM/ML tags
@@ -63,21 +86,13 @@ enum Commands {
 #[derive(Parser, Debug)]
 struct SimulateArgs {
     // ========== Input Mode Selection (pick one) ==========
-    /// Tag existing FASTQ/FASTA file with methylation (untagged inputs allowed)
+    /// Tag existing FASTQ/SAM/BAM file with methylation (untagged inputs allowed)
     #[arg(long, help_heading = "Input Mode (choose one)")]
     reads: Option<PathBuf>,
 
     /// Reference FASTA for simulating new reads (use with --num-reads)
     #[arg(long, help_heading = "Input Mode (choose one)")]
     reference: Option<PathBuf>,
-
-    /// Input BAM file to tag directly with methylation (reads SEQ field, adds MM/ML tags)
-    #[arg(long, help_heading = "Input Mode (choose one)")]
-    bam_input: Option<PathBuf>,
-
-    /// Output BAM path (required when using --bam-input)
-    #[arg(long, help_heading = "BAM Tagging Mode")]
-    bam_output: Option<PathBuf>,
 
     // ========== Required: Motif Definitions ==========
     /// Motif specification(s): 'motif[:canonical[:offset[:mod[:strand]]]]' or 'sequence_modtype_offset[_strand]'
@@ -103,32 +118,15 @@ struct SimulateArgs {
     #[arg(long, default_value_t = SimulatorKind::Builtin, value_enum, help_heading = "Simulation Options")]
     simulator: SimulatorKind,
 
-    /// Amount of sequence to generate: absolute like '250M' (bases) or coverage like '25x'
+    /// Number of reads to generate, or sequence amount: absolute like '250M' (bases) or coverage like '25x'
     ///
-    /// Examples: '100M' = 100 million bases, '50x' = 50x coverage of reference
-    /// If not specified, uses --num-reads instead
-    #[arg(
-        long,
-        help_heading = "Simulation Options",
-        conflicts_with = "num_reads"
-    )]
-    quantity: Option<String>,
-
-    /// Number of reads to generate (deprecated: use --quantity instead)
-    #[arg(long, default_value_t = 100, help_heading = "Simulation Options")]
-    num_reads: usize,
+    /// Examples: '100M' = 100 million bases, '50x' = 50x coverage of reference, '10000' = 10k reads
+    #[arg(long, default_value = "100", help_heading = "Simulation Options")]
+    quantity: String,
 
     /// Target read length in bp (mode of distribution)
     #[arg(long, default_value_t = 5000, help_heading = "Simulation Options")]
     read_length: usize,
-
-    /// Alternative: specify mean read length (overrides --read-length)
-    #[arg(long, help_heading = "Simulation Options")]
-    read_length_mean: Option<usize>,
-
-    /// Alternative: specify read length N50 (overrides --read-length)
-    #[arg(long, help_heading = "Simulation Options")]
-    read_length_n50: Option<usize>,
 
     /// Prefix for simulated read names (e.g., 'methylsim_000001')
     #[arg(long, default_value = "methylsim", help_heading = "Simulation Options")]
@@ -237,13 +235,23 @@ struct SimulateArgs {
     low_beta_beta: f64,
 
     // ========== Output Options ==========
-    /// Output FASTQ file path
+    /// Output file path
     #[arg(
-        long,
+        short = 'o',
+        long = "out",
         default_value = "methylsim.fastq",
         help_heading = "Output Options"
     )]
-    output_fastq: PathBuf,
+    out: PathBuf,
+
+    /// Output format (fastq, sam, bam)
+    #[arg(
+        long = "out-format",
+        default_value_t = OutputFormat::Fastq,
+        value_enum,
+        help_heading = "Output Options"
+    )]
+    out_format: OutputFormat,
 
     /// Optional TSV output with read_id, MM, ML columns
     #[arg(long, help_heading = "Output Options")]
@@ -301,8 +309,313 @@ struct WriteStats {
     total_motif_high: usize,
 }
 
+impl OutputFormat {
+    fn label(&self) -> &'static str {
+        match self {
+            OutputFormat::Fastq => "FASTQ",
+            OutputFormat::Sam => "SAM",
+            OutputFormat::Bam => "BAM",
+        }
+    }
+
+    fn extensions(&self) -> &'static [&'static str] {
+        match self {
+            OutputFormat::Fastq => &["fastq", "fq"],
+            OutputFormat::Sam => &["sam"],
+            OutputFormat::Bam => &["bam"],
+        }
+    }
+}
+
+impl InputFormat {
+    fn from_path(path: &Path) -> Result<Self> {
+        if let Some(ext) = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|s| s.to_ascii_lowercase())
+        {
+            match ext.as_str() {
+                "bam" => return Ok(InputFormat::Bam),
+                "sam" => return Ok(InputFormat::Sam),
+                _ => {}
+            }
+        }
+        Ok(InputFormat::Fastx)
+    }
+}
+
+struct OutputWriter {
+    target: OutputTarget,
+}
+
+enum OutputTarget {
+    Fastq(BufWriter<File>),
+    Sam(SamOutput),
+    Bam(BamOutput),
+}
+
+impl OutputWriter {
+    fn new(path: &Path, format: OutputFormat) -> Result<Self> {
+        let target = match format {
+            OutputFormat::Fastq => {
+                let writer = BufWriter::new(
+                    File::create(path)
+                        .with_context(|| format!("Failed to create '{}'", path.display()))?,
+                );
+                OutputTarget::Fastq(writer)
+            }
+            OutputFormat::Sam => OutputTarget::Sam(SamOutput::new(path)?),
+            OutputFormat::Bam => OutputTarget::Bam(BamOutput::new(path)?),
+        };
+        Ok(Self { target })
+    }
+
+    fn write(&mut self, read: &ReadRecord, tags: &TagResult) -> Result<()> {
+        match &mut self.target {
+            OutputTarget::Fastq(writer) => write_fastq_record(writer, read, tags),
+            OutputTarget::Sam(writer) => writer.write_record(read, tags),
+            OutputTarget::Bam(writer) => writer.write_record(read, tags),
+        }
+    }
+
+    fn finish(self) -> Result<()> {
+        match self.target {
+            OutputTarget::Fastq(mut writer) => {
+                writer.flush()?;
+            }
+            OutputTarget::Sam(mut writer) => {
+                writer.finish()?;
+            }
+            OutputTarget::Bam(mut writer) => {
+                writer.finish()?;
+            }
+        }
+        Ok(())
+    }
+}
+
+struct SamOutput {
+    writer: SamWriter<BufWriter<File>>,
+    header: sam::Header,
+}
+
+impl SamOutput {
+    fn new(path: &Path) -> Result<Self> {
+        let header = default_output_header()?;
+        let writer = BufWriter::new(
+            File::create(path).with_context(|| format!("Failed to create '{}'", path.display()))?,
+        );
+        let mut writer = SamWriter::new(writer);
+        writer.write_header(&header)?;
+        Ok(Self { writer, header })
+    }
+
+    fn write_record(&mut self, read: &ReadRecord, tags: &TagResult) -> Result<()> {
+        let record = build_alignment_record(read, tags)?;
+        self.writer
+            .write_alignment_record(&self.header, &record)
+            .with_context(|| "Failed to write SAM record")?;
+        Ok(())
+    }
+
+    fn finish(&mut self) -> Result<()> {
+        self.writer.finish(&self.header)?;
+        Ok(())
+    }
+}
+
+struct BamOutput {
+    writer: BamWriter<bgzf::Writer<File>>,
+    header: sam::Header,
+}
+
+impl BamOutput {
+    fn new(path: &Path) -> Result<Self> {
+        let header = default_output_header()?;
+        let mut writer = BamWriterBuilder::default()
+            .build_from_path(path)
+            .with_context(|| format!("Failed to create '{}'", path.display()))?;
+        writer.write_header(&header)?;
+        Ok(Self { writer, header })
+    }
+
+    fn write_record(&mut self, read: &ReadRecord, tags: &TagResult) -> Result<()> {
+        let record = build_alignment_record(read, tags)?;
+        self.writer
+            .write_alignment_record(&self.header, &record)
+            .with_context(|| "Failed to write BAM record")?;
+        Ok(())
+    }
+
+    fn finish(&mut self) -> Result<()> {
+        self.writer.finish(&self.header)?;
+        Ok(())
+    }
+}
+
+fn default_output_header() -> Result<sam::Header> {
+    const HEADER: &str = "@HD\tVN:1.6\tSO:unknown\n@PG\tID:methylsim\tPN:methylsim\n";
+    sam::Header::from_str(HEADER).context("Failed to build SAM/BAM header")
+}
+
+fn ensure_output_extension(path: &Path, format: OutputFormat) -> Result<()> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .ok_or_else(|| anyhow!("Output file must include an extension"))?;
+
+    if !format.extensions().iter().any(|allowed| *allowed == ext) {
+        bail!(
+            "Output path '{}' does not match output format {} (expected extension: {})",
+            path.display(),
+            format.label(),
+            format.extensions().join(", ")
+        );
+    }
+    Ok(())
+}
+
+fn build_alignment_record(read: &ReadRecord, tags: &TagResult) -> Result<alignment::RecordBuf> {
+    let name = record_buf::Name::from(read.name.as_bytes());
+    let sequence = record_buf::Sequence::from(read.sequence.clone());
+    let quality_scores = record_buf::QualityScores::from(read.quality.clone());
+    let data = build_tag_data(tags)?;
+
+    let record = record_buf::RecordBuf::builder()
+        .set_name(name)
+        .set_sequence(sequence)
+        .set_quality_scores(quality_scores)
+        .set_data(data)
+        .build();
+
+    Ok(record)
+}
+
+fn build_tag_data(tags: &TagResult) -> Result<record_buf::Data> {
+    use noodles::sam::alignment::record_buf::data::field::{self, Value};
+
+    let mut fields: Vec<(Tag, Value)> = Vec::new();
+
+    if let Some(mm) = &tags.mm_tag {
+        let value = mm
+            .strip_prefix("MM:Z:")
+            .or_else(|| mm.strip_prefix("MM:"))
+            .unwrap_or(mm.as_str())
+            .to_string();
+        fields.push((Tag::new(b'M', b'M'), Value::String(value.into())));
+    }
+
+    if let Some(ml) = &tags.ml_tag {
+        let values = parse_ml_values(ml)?;
+        if let Some(values) = values {
+            fields.push((
+                Tag::new(b'M', b'L'),
+                Value::Array(field::value::Array::UInt8(values)),
+            ));
+        }
+    }
+
+    Ok(fields.into_iter().collect())
+}
+
+fn parse_ml_values(raw: &str) -> Result<Option<Vec<u8>>> {
+    let trimmed = raw
+        .strip_prefix("ML:B:")
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| raw.to_string());
+
+    let mut parts = trimmed.splitn(2, ',');
+    let type_code = parts.next().unwrap_or("C");
+    let list = parts.next().unwrap_or("");
+
+    if type_code != "C" {
+        warn!(
+            "Unsupported ML type '{}' in '{}'; skipping ML tag for this read",
+            type_code, raw
+        );
+        return Ok(None);
+    }
+    if list.is_empty() {
+        return Ok(Some(Vec::new()));
+    }
+
+    let mut values = Vec::new();
+    for value in list.split(',').filter(|s| !s.is_empty()) {
+        let parsed = value.parse::<u8>().with_context(|| {
+            format!(
+                "Invalid ML value '{}' in '{}'; expected unsigned byte",
+                value, raw
+            )
+        })?;
+        values.push(parsed);
+    }
+    Ok(Some(values))
+}
+
 struct LoadedModel {
     model: LearnedModel,
+}
+
+fn read_alignment_record_buf(record: &record_buf::RecordBuf, idx: usize) -> ReadRecord {
+    let name = record
+        .name()
+        .map(|n| String::from_utf8_lossy(n.as_ref()).into_owned())
+        .unwrap_or_else(|| format!("read_{idx:06}"));
+
+    let mut sequence = record.sequence().as_ref().to_vec();
+    for base in sequence.iter_mut() {
+        base.make_ascii_uppercase();
+    }
+
+    let mut quality: Vec<u8> = record
+        .quality_scores()
+        .iter()
+        .map(|q| q.saturating_add(33))
+        .collect();
+    if quality.is_empty() {
+        quality = vec![b'I'; sequence.len()];
+    }
+
+    ReadRecord::new(name, sequence, quality)
+}
+
+fn read_sam_reads(path: &Path) -> Result<Vec<ReadRecord>> {
+    let mut reader = SamReaderBuilder::default()
+        .build_from_path(path)
+        .with_context(|| format!("Failed to open SAM file '{}'", path.display()))?;
+    let header = reader
+        .read_header()
+        .with_context(|| format!("Failed to read SAM header from '{}'", path.display()))?;
+    let mut reads = Vec::new();
+    for (idx, result) in reader.record_bufs(&header).enumerate() {
+        let record = result.with_context(|| format!("Failed to read SAM record {}", idx + 1))?;
+        reads.push(read_alignment_record_buf(&record, idx));
+    }
+    Ok(reads)
+}
+
+fn read_bam_reads(path: &Path) -> Result<Vec<ReadRecord>> {
+    let mut reader = BamReaderBuilder::default()
+        .build_from_path(path)
+        .with_context(|| format!("Failed to open BAM file '{}'", path.display()))?;
+    let header = reader
+        .read_header()
+        .with_context(|| format!("Failed to read BAM header from '{}'", path.display()))?;
+    let mut reads = Vec::new();
+    for (idx, result) in reader.record_bufs(&header).enumerate() {
+        let record = result.with_context(|| format!("Failed to read BAM record {}", idx + 1))?;
+        reads.push(read_alignment_record_buf(&record, idx));
+    }
+    Ok(reads)
+}
+
+fn read_input_reads(path: &Path) -> Result<Vec<ReadRecord>> {
+    match InputFormat::from_path(path)? {
+        InputFormat::Fastx => read_fastx(path),
+        InputFormat::Sam => read_sam_reads(path),
+        InputFormat::Bam => read_bam_reads(path),
+    }
 }
 
 #[derive(Debug)]
@@ -408,37 +721,51 @@ fn parse_quantity(quantity: &str, reference_size: usize, mean_read_length: usize
 
         Ok(num_reads)
     } else {
-        // Parse absolute base count with suffix (K, M, G, or just a number)
-        let (num_str, multiplier) = if quantity.ends_with('K') {
-            (&quantity[..quantity.len() - 1], 1_000)
-        } else if quantity.ends_with('M') {
-            (&quantity[..quantity.len() - 1], 1_000_000)
-        } else if quantity.ends_with('G') {
-            (&quantity[..quantity.len() - 1], 1_000_000_000)
+        // Parse absolute base count with suffix (K, M, G) or plain number = reads
+        let has_suffix =
+            quantity.ends_with('K') || quantity.ends_with('M') || quantity.ends_with('G');
+        if has_suffix {
+            let (num_str, multiplier) = if quantity.ends_with('K') {
+                (&quantity[..quantity.len() - 1], 1_000)
+            } else if quantity.ends_with('M') {
+                (&quantity[..quantity.len() - 1], 1_000_000)
+            } else {
+                (&quantity[..quantity.len() - 1], 1_000_000_000)
+            };
+
+            let total_bases: f64 = num_str.parse().with_context(|| {
+                format!(
+                    "Invalid quantity '{}'. Expected format like '250M', '25x', or a plain number",
+                    quantity
+                )
+            })?;
+
+            if total_bases <= 0.0 {
+                bail!("Quantity must be positive, got: {}", total_bases);
+            }
+
+            let total_bases = (total_bases * multiplier as f64) as usize;
+            let num_reads = (total_bases as f64 / mean_read_length as f64).ceil() as usize;
+
+            info!(
+                "Absolute quantity: {} bases → {} reads (read_length: {})",
+                total_bases, num_reads, mean_read_length
+            );
+
+            Ok(num_reads)
         } else {
-            (quantity.as_str(), 1)
-        };
-
-        let total_bases: f64 = num_str.parse().with_context(|| {
-            format!(
-                "Invalid quantity '{}'. Expected format like '250M', '25x', or a plain number",
-                quantity
-            )
-        })?;
-
-        if total_bases <= 0.0 {
-            bail!("Quantity must be positive, got: {}", total_bases);
+            let num_reads: usize = quantity.parse().with_context(|| {
+                format!(
+                    "Invalid quantity '{}'. Expected integer reads, coverage (25x), or bases (250M)",
+                    quantity
+                )
+            })?;
+            if num_reads == 0 {
+                bail!("Quantity must be greater than zero");
+            }
+            info!("Quantity specified as reads: {}", num_reads);
+            Ok(num_reads)
         }
-
-        let total_bases = (total_bases * multiplier as f64) as usize;
-        let num_reads = (total_bases as f64 / mean_read_length as f64).ceil() as usize;
-
-        info!(
-            "Absolute quantity: {} bases → {} reads (read_length: {})",
-            total_bases, num_reads, mean_read_length
-        );
-
-        Ok(num_reads)
     }
 }
 
@@ -523,22 +850,9 @@ fn build_simulator_strategy(args: &SimulateArgs) -> Result<Option<SimulatorKindS
         reference_size
     );
 
-    let length_spec = if let Some(mean) = args.read_length_mean {
-        ReadLengthSpec::Mean(mean)
-    } else if let Some(n50) = args.read_length_n50 {
-        ReadLengthSpec::N50(n50)
-    } else {
-        ReadLengthSpec::Mode(args.read_length)
-    };
+    let length_spec = ReadLengthSpec::Mode(args.read_length);
 
-    let num_reads = if let Some(quantity) = &args.quantity {
-        let mean_length = args
-            .read_length_mean
-            .unwrap_or_else(|| args.read_length_n50.unwrap_or(args.read_length));
-        parse_quantity(quantity, reference_size, mean_length)?
-    } else {
-        args.num_reads
-    };
+    let num_reads = parse_quantity(&args.quantity, reference_size, args.read_length)?;
 
     match args.simulator {
         SimulatorKind::Builtin => {
@@ -571,6 +885,7 @@ fn build_simulator_strategy(args: &SimulateArgs) -> Result<Option<SimulatorKindS
                 read_length: args.read_length,
                 executable: args.badreads_exec.clone(),
                 extra_args: args.badreads_extra.clone(),
+                name_prefix: args.name_prefix.clone(),
                 seed: args.seed,
             };
             Ok(Some(SimulatorKindStrategy::Badreads(
@@ -582,29 +897,9 @@ fn build_simulator_strategy(args: &SimulateArgs) -> Result<Option<SimulatorKindS
 
 fn run_simulate(args: SimulateArgs) -> Result<()> {
     validate_simulate_inputs(&args)?;
+    ensure_output_extension(&args.out, args.out_format)?;
     let loaded_model = load_model_source(args.model_in.as_ref(), args.model_preset)?;
     let model_ref = loaded_model.as_ref().map(|m| &m.model);
-
-    // Handle direct BAM tagging mode
-    if args.reads.is_none() && args.reference.is_none() && args.bam_input.is_some() {
-        let bam_in = args.bam_input.as_ref().unwrap();
-        let bam_out = args
-            .bam_output
-            .as_ref()
-            .expect("--bam-output must be supplied when using --bam-input");
-
-        let motif_specs = collect_motif_specs(&args.motifs, args.motifs_file.as_ref(), model_ref)?;
-        let motifs = motif_specs
-            .iter()
-            .map(|spec| MotifDefinition::parse(spec))
-            .collect::<Result<Vec<_>>>()?;
-        let sampler_map = model_ref.map(|model| model.build_samplers()).transpose()?;
-
-        let mut tagger = build_tagger_from_args(motifs, &args, sampler_map, model_ref)?;
-
-        tag_bam_directly(bam_in, bam_out, &mut tagger)?;
-        return Ok(());
-    }
 
     let motif_specs = collect_motif_specs(&args.motifs, args.motifs_file.as_ref(), model_ref)?;
     let motifs = motif_specs
@@ -615,10 +910,7 @@ fn run_simulate(args: SimulateArgs) -> Result<()> {
 
     let mut tagger = build_tagger_from_args(motifs, &args, sampler_map, model_ref)?;
 
-    let mut fastq_writer = BufWriter::new(
-        File::create(&args.output_fastq)
-            .with_context(|| format!("Failed to create '{}'", args.output_fastq.display()))?,
-    );
+    let mut output_writer = OutputWriter::new(&args.out, args.out_format)?;
     let mut tags_writer = if let Some(path) = &args.tags_tsv {
         let mut writer = BufWriter::new(
             File::create(path).with_context(|| format!("Failed to create '{}'", path.display()))?,
@@ -635,12 +927,12 @@ fn run_simulate(args: SimulateArgs) -> Result<()> {
             "Annotating existing reads from '{}'...",
             reads_path.display()
         );
-        let reads = read_fastx(reads_path)?;
+        let reads = read_input_reads(reads_path)?;
         for read in reads {
             write_read(
                 &read,
                 &mut tagger,
-                &mut fastq_writer,
+                &mut output_writer,
                 &mut tags_writer,
                 &mut stats,
             )?;
@@ -653,22 +945,23 @@ fn run_simulate(args: SimulateArgs) -> Result<()> {
             write_read(
                 &read,
                 &mut tagger,
-                &mut fastq_writer,
+                &mut output_writer,
                 &mut tags_writer,
                 &mut stats,
             )?;
         }
     }
 
-    fastq_writer.flush()?;
+    output_writer.finish()?;
     if let Some(writer) = tags_writer.as_mut() {
         writer.flush()?;
     }
 
     println!(
-        "Wrote {} reads to {} ({} reads carried MM/ML tags)",
+        "Wrote {} reads to {} as {} ({} reads carried MM/ML tags)",
         stats.total_reads,
-        args.output_fastq.display(),
+        args.out.display(),
+        args.out_format.label(),
         stats.tagged_reads
     );
     if stats.total_reads > 0 {
@@ -720,11 +1013,8 @@ fn validate_simulate_inputs(args: &SimulateArgs) -> Result<()> {
     if args.model_in.is_some() && args.model_preset.is_some() {
         bail!("Only one of --model-in or --model-preset can be supplied");
     }
-    if args.reads.is_none() && args.reference.is_none() && args.bam_input.is_none() {
-        bail!("Simulate requires either --reads, --reference, or --bam-input");
-    }
-    if args.bam_input.is_some() && args.bam_output.is_none() {
-        bail!("--bam-input requires --bam-output");
+    if args.reads.is_none() && args.reference.is_none() {
+        bail!("Simulate requires either --reads or --reference");
     }
     let doing_reads = args.reads.is_some() || args.reference.is_some();
     if doing_reads {
@@ -742,19 +1032,6 @@ fn validate_simulate_inputs(args: &SimulateArgs) -> Result<()> {
         }
         if args.read_length == 0 {
             bail!("--read-length must be greater than zero");
-        }
-        if let Some(mean) = args.read_length_mean {
-            if mean == 0 {
-                bail!("--read-length-mean must be greater than zero");
-            }
-        }
-        if let Some(n50) = args.read_length_n50 {
-            if n50 == 0 {
-                bail!("--read-length-n50 must be greater than zero");
-            }
-        }
-        if args.read_length_mean.is_some() && args.read_length_n50.is_some() {
-            bail!("Only one of --read-length-mean or --read-length-n50 can be supplied");
         }
         if !(0.0..=1.0).contains(&args.motif_high_prob) {
             bail!("--motif-high-prob must be between 0 and 1");
@@ -794,30 +1071,15 @@ fn validate_fit_inputs(args: &FitModelArgs) -> Result<()> {
 fn write_read(
     read: &ReadRecord,
     tagger: &mut MethylationTagger,
-    fastq_writer: &mut BufWriter<File>,
+    output_writer: &mut OutputWriter,
     tags_writer: &mut Option<BufWriter<File>>,
     stats: &mut WriteStats,
 ) -> Result<()> {
     let tags = tagger.annotate(read.sequence_str());
-    let mut header = format!("@{}", read.name);
-    if let Some(comment) = &read.comment {
-        header.push_str(comment);
-    }
     if tags.mm_tag.is_some() || tags.ml_tag.is_some() {
         stats.tagged_reads += 1;
-        if let Some(mm) = &tags.mm_tag {
-            header.push('\t');
-            header.push_str(mm);
-        }
-        if let Some(ml) = &tags.ml_tag {
-            header.push('\t');
-            header.push_str(ml);
-        }
     }
-    writeln!(fastq_writer, "{header}")?;
-    writeln!(fastq_writer, "{}", read.sequence_str())?;
-    writeln!(fastq_writer, "+")?;
-    writeln!(fastq_writer, "{}", read.quality_str())?;
+    output_writer.write(read, &tags)?;
 
     if let Some(writer) = tags_writer.as_mut() {
         writeln!(
@@ -837,141 +1099,29 @@ fn write_read(
     Ok(())
 }
 
-/// Tag BAM file directly by reading SEQ field and adding MM/ML tags
-fn tag_bam_directly(bam_in: &Path, bam_out: &Path, tagger: &mut MethylationTagger) -> Result<()> {
-    info!("Starting direct BAM tagging");
-    debug!("Input BAM: {}", bam_in.display());
-    debug!("Output BAM: {}", bam_out.display());
-
-    let mut view_proc = Command::new("samtools")
-        .arg("view")
-        .arg("-h")
-        .arg(bam_in)
-        .stdout(Stdio::piped())
-        .spawn()
-        .with_context(|| "Failed to spawn 'samtools view -h'")?;
-
-    let mut write_proc = Command::new("samtools")
-        .arg("view")
-        .arg("-b")
-        .arg("-o")
-        .arg(bam_out)
-        .arg("-")
-        .stdin(Stdio::piped())
-        .spawn()
-        .with_context(|| "Failed to spawn 'samtools view -b'")?;
-
-    let reader_stdout = view_proc
-        .stdout
-        .take()
-        .ok_or_else(|| anyhow!("Failed to capture samtools stdout"))?;
-    let writer_stdin = write_proc
-        .stdin
-        .take()
-        .ok_or_else(|| anyhow!("Failed to capture samtools stdin"))?;
-
-    let mut reader = BufReader::new(reader_stdout);
-    let mut writer = BufWriter::new(writer_stdin);
-    let mut line = String::new();
-    let mut tagged = 0usize;
-    let mut total = 0usize;
-    let mut headers = 0usize;
-
-    info!("Processing BAM records...");
-    loop {
-        line.clear();
-        let bytes = reader.read_line(&mut line)?;
-        if bytes == 0 {
-            break;
-        }
-
-        // Pass through header lines
-        if line.starts_with('@') {
-            headers += 1;
-            writer.write_all(line.as_bytes())?;
-            continue;
-        }
-
-        // Log progress periodically
-        if total > 0 && total % 10000 == 0 {
-            info!(
-                "Processed {} reads, tagged {} ({:.1}%)",
-                total,
-                tagged,
-                (tagged as f64 / total as f64) * 100.0
-            );
-        }
-
-        // Trim newlines
-        while line.ends_with('\n') || line.ends_with('\r') {
-            line.pop();
-        }
-
-        if line.is_empty() {
-            writer.write_all(b"\n")?;
-            continue;
-        }
-
-        let mut fields: Vec<String> = line.split('\t').map(|s| s.to_string()).collect();
-
-        // BAM format: QNAME FLAG RNAME POS MAPQ CIGAR RNEXT PNEXT TLEN SEQ QUAL [TAGS...]
-        if fields.len() >= 11 {
-            let seq = &fields[9];
-
-            // Tag the sequence
-            let tags = tagger.annotate(seq);
-
-            // Remove existing MM/ML tags
-            fields.retain(|field| !(field.starts_with("MM:Z:") || field.starts_with("ML:B:")));
-
-            // Add new tags if present
-            if tags.mm_tag.is_some() || tags.ml_tag.is_some() {
-                if let Some(mm) = &tags.mm_tag {
-                    fields.push(mm.clone());
-                }
-                if let Some(ml) = &tags.ml_tag {
-                    fields.push(ml.clone());
-                }
-                tagged += 1;
-            }
-        }
-
-        total += 1;
-        let mut rebuilt = fields.join("\t");
-        rebuilt.push('\n');
-        writer.write_all(rebuilt.as_bytes())?;
+fn write_fastq_record(
+    fastq_writer: &mut BufWriter<File>,
+    read: &ReadRecord,
+    tags: &TagResult,
+) -> Result<()> {
+    let mut header = format!("@{}", read.name);
+    if let Some(comment) = &read.comment {
+        header.push_str(comment);
     }
-
-    writer.flush()?;
-    drop(writer);
-
-    let write_status = write_proc
-        .wait()
-        .with_context(|| "samtools view -b terminated unexpectedly")?;
-    if !write_status.success() {
-        bail!("samtools view -b exited with {}", write_status);
+    if tags.mm_tag.is_some() || tags.ml_tag.is_some() {
+        if let Some(mm) = &tags.mm_tag {
+            header.push('\t');
+            header.push_str(mm);
+        }
+        if let Some(ml) = &tags.ml_tag {
+            header.push('\t');
+            header.push_str(ml);
+        }
     }
-
-    let view_status = view_proc
-        .wait()
-        .with_context(|| "samtools view -h terminated unexpectedly")?;
-    if !view_status.success() {
-        bail!("samtools view -h exited with {}", view_status);
-    }
-
-    debug!("Processed {} header lines", headers);
-    info!(
-        "BAM tagging complete: tagged {} of {} reads ({:.1}%) → {}",
-        tagged,
-        total,
-        if total > 0 {
-            (tagged as f64 / total as f64) * 100.0
-        } else {
-            0.0
-        },
-        bam_out.display()
-    );
-
+    writeln!(fastq_writer, "{header}")?;
+    writeln!(fastq_writer, "{}", read.sequence_str())?;
+    writeln!(fastq_writer, "+")?;
+    writeln!(fastq_writer, "{}", read.quality_str())?;
     Ok(())
 }
 
@@ -999,6 +1149,52 @@ mod cli_tests {
         match cli.command {
             Commands::Simulate(args) => {
                 assert_eq!(args.badreads_extra.as_deref(), Some("--quantity 50x"));
+            }
+            _ => panic!("Expected Simulate command"),
+        }
+    }
+
+    #[test]
+    fn simulate_defaults_output_flags() {
+        let cli = Cli::try_parse_from([
+            "methylsim",
+            "simulate",
+            "--motif",
+            "CG",
+            "--reads",
+            "reads.fastq",
+        ])
+        .expect("Cli parsing failed");
+
+        match cli.command {
+            Commands::Simulate(args) => {
+                assert_eq!(args.out, PathBuf::from("methylsim.fastq"));
+                assert_eq!(args.out_format, OutputFormat::Fastq);
+            }
+            _ => panic!("Expected Simulate command"),
+        }
+    }
+
+    #[test]
+    fn simulate_accepts_bam_output_format() {
+        let cli = Cli::try_parse_from([
+            "methylsim",
+            "simulate",
+            "--motif",
+            "CG",
+            "--reads",
+            "reads.fastq",
+            "--out",
+            "custom.bam",
+            "--out-format",
+            "bam",
+        ])
+        .expect("Cli parsing failed");
+
+        match cli.command {
+            Commands::Simulate(args) => {
+                assert_eq!(args.out, PathBuf::from("custom.bam"));
+                assert_eq!(args.out_format, OutputFormat::Bam);
             }
             _ => panic!("Expected Simulate command"),
         }

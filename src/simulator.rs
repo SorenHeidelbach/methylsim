@@ -28,6 +28,7 @@ pub struct BadreadsSimulationConfig {
     pub read_length: usize,
     pub executable: Option<PathBuf>,
     pub extra_args: Option<String>,
+    pub name_prefix: String,
     pub seed: u64,
 }
 
@@ -45,8 +46,6 @@ pub struct ErrorProfile {
 #[derive(Copy, Clone, Debug)]
 pub enum ReadLengthSpec {
     Mode(usize),
-    Mean(usize),
-    N50(usize),
 }
 
 pub fn load_references(path: &Path) -> Result<Vec<String>> {
@@ -284,14 +283,18 @@ impl BadreadsStrategy {
 
 impl SimulatorStrategy for BadreadsStrategy {
     fn simulate(&mut self) -> Result<Vec<ReadRecord>> {
-        run_badreads(
+        let mut reads = run_badreads(
             &self.config.reference,
             self.config.num_reads,
             Some(self.config.read_length),
             self.config.executable.as_ref(),
             self.config.extra_args.as_deref(),
             Some(self.config.seed),
-        )
+        )?;
+        for (idx, read) in reads.iter_mut().enumerate() {
+            read.name = format!("{}_{}", self.config.name_prefix, format!("{:06}", idx + 1));
+        }
+        Ok(reads)
     }
 }
 
@@ -310,21 +313,6 @@ impl ReadLengthSampler {
                 }
                 let tail_mean = (mode as f64 * 0.3).max(50.0);
                 (mode as f64, tail_mean)
-            }
-            ReadLengthSpec::Mean(mean) => {
-                if mean == 0 {
-                    bail!("Mean read length must be greater than zero");
-                }
-                let tail_mean = (mean as f64 * 0.25).max(50.0);
-                (mean as f64 + tail_mean, tail_mean)
-            }
-            ReadLengthSpec::N50(n50) => {
-                if n50 == 0 {
-                    bail!("Read length N50 must be greater than zero");
-                }
-                let tail_mean = (n50 as f64 * 0.2).max(50.0);
-                let peak = n50 as f64 + tail_mean * std::f64::consts::LN_2;
-                (peak, tail_mean)
             }
         };
         let lambda = (1.0 / tail_mean).max(1e-6);
